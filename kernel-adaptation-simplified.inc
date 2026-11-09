@@ -63,8 +63,10 @@ Group:          System
 License:        GPLv2
 Provides:       kernel
 Provides:       droid-hal-kernel
+%if 0%{?bootimg_name:1}
 Provides:       droid-hal-img-boot
 Provides:       droid-hal-img-recovery
+%endif
 Source:         %{name}-%{version}.tar.bz2
 Requires(pre):  kmod >= 9
 BuildRequires:  pkgconfig(ncurses)
