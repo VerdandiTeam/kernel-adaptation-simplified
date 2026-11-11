@@ -421,6 +421,8 @@ Requires: alsa-ucm-conf
 
 Keep the rest: `droid-hal-<device>-img-boot`, the `droid-config-<device>-*` packages, `droid-hal-version-<device>`, `usb-moded`, `mce-plugin-libhybris` and so on.
 
+Jolla's per-device and consumer patterns pull several Settings pages that the common pattern does not **(Pro1-X)**. Add the ones your device needs: `jolla-settings-networking-multisim` (SIM cards), `jolla-settings-system-orientation` (Display > Orientation, the orientation lock in the top menu, rotating home screen), `jolla-settings-system-sideloading`. `jolla-settings-system-flashlight` works on mainline with a provider in place of droidmedia's: the Pro1-X ships `sysfs-flashlight`, Jolla's provider with the Android camera call replaced by the LED's torch mode.
+
 - `pulseaudio-module-keepalive`: Sailfish's PulseAudio config loads `module-keepalive`. droid-configs pulls this package in for native builds, in place of `pulseaudio-modules-droid`.
 - Image type: because the pattern requires the boot image package and not the kernel package, `build_packages.sh -i` builds a loop image, which your pack script turns into flashable images. A pattern that requires `kernel-adaptation-<device>` gets a rootfs tarball instead.
 
@@ -446,6 +448,8 @@ QT_QPA_EGLFS_INTEGRATION=eglfs_kms
 QT_QPA_EGLFS_PHYSICAL_WIDTH=<panel width in mm>
 QT_QPA_EGLFS_PHYSICAL_HEIGHT=<panel height in mm>
 ```
+
+The Pro1-X also sets `QT_QPA_EGLFS_KMS_CONFIG=/etc/eglfs-config.json` there, with `device` `/dev/dri/card0` and `hwcursor` false **(Pro1-X)**.
 
 ### Kickstart
 
@@ -1091,7 +1095,7 @@ ACTION=="add", SUBSYSTEM=="ieee80211", RUN+="/usr/sbin/iw phy %k wowlan enable a
 connman keys saved networks by MAC address, so they vanish whenever the address changes. There are two ways to fix it:
 
 - **Device tree:** give the kernel the real address (`local-mac-address`, `local-bd-address`, often filled in by the bootloader). This is the cleaner way.
-- **Userspace:** set the address when the interface appears. That races with connman. victara does this one, with udev-started services that read the factory data (`ip link set ... address` for Wi-Fi, `btmgmt public-addr` for Bluetooth).
+- **Userspace:** set the address when the interface appears. That races with connman. victara does this one, with udev-started services that read the factory data (`ip link set ... address` for Wi-Fi, `btmgmt public-addr` for Bluetooth). The Pro1-X has no readable factory data for Wi-Fi and derives a locally administered address from `/etc/machine-id` (`02` plus ten hex digits of its sha256), set from a udev-started unit when wlan0 appears, so the late interface holds up neither connman nor the user session; connman is restarted once afterwards **(Pro1-X)**.
 
 ### Sensors
 
