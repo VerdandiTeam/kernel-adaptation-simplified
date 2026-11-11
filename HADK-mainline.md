@@ -1249,6 +1249,19 @@ The Pro1-X boots a plain Android boot image (header v0, kernel with the DTB appe
 
 This ABL refuses `fastboot boot`, so every kernel test is a flash of `boot_a`; keep the previous image. From a running system `systemctl reboot bootloader` lands in fastboot. The first logo after power-on is drawn by the signed firmware and cannot be changed; the port draws its own splash from the initramfs onto `/dev/fb0` as its first step, with the kernel console kept off the screen.
 
+### Fingerprint
+
+#### The sensor hangs off a TrustZone-owned bus
+
+On Qualcomm phones the fingerprint sensor's SPI controller is usually disabled in every stock device tree and its pins are reserved in the mainline device tree: TrustZone owns the bus, and the sensor is read by a trusted application (TA) that the vendor's Android HAL talks to over QSEECOM. No Linux SPI driver can take it over. What works instead, bottom up:
+
+1. **Kernel:** Bartosz Wróbel's out-of-tree QSEECOM TEE driver (`drivers/tee/qseecom`, `github.com/wrobelda/goodix-fp-spi-linux`, `CONFIG_TEE_QSEECOM=m`), which loads TAs and sends them commands through the Linux TEE ioctls. Two fixes are needed on top as of 7.3 (both in the SM6115 port's kernel series, neither upstream yet): the driver's listener loop must bound *failed* requests, not served ones (a TA reads its template store through the file listener in 20 KB pieces, hundreds of served requests for one command), and mainline's `qcom_tzmem_shm_bridge_create()` passes a positive firmware status up through `ERR_PTR()`, which `IS_ERR()` does not catch; the first `qcom_tzmem_alloc()` on that "pool" oopses. Without both, a device with a few enrolled fingers hangs hard on the daemon's first command.
+2. **Supplicant:** `qsee-supplicant` (same author) answers the TA's file-system listener requests, so templates land under `/var/lib/qsee-supplicant` (root only, back it up before kernel experiments), and `qsee-app-loader@<ta>` keeps the TA loaded. The stock TA firmware comes from the vendor image and is not redistributable.
+3. **Daemon:** implement `org.sailfishos.fingerprint1`, the D-Bus API of Jolla's `sailfish-fpd`, yourself (model: `sailfishos-open/sailfish-fpd-community`'s D-Bus side; its hardware side is the Android HAL through libhybris and does not apply), with `Provides: sailfish-fpd` so Jolla's package, which needs a closed hybris slave, is never pulled. The hardware side replays the vendor HAL's command sequence to the TA: read it off the HAL library's disassembly, from the first command on (a TA that gets any command before its init kills its instance; some TAs answer in place over the request and need the request passed INOUT). Power the sensor's enable GPIO yourself; polling the TA's touch detection every 30 ms is enough for enrolment and lock screen unlock.
+4. **Device lock:** install Jolla's `sailfish-devicelock-fpd` and `sailfish-devicelock-libs` from the release repository (`zypper in --force-resolution`: it replaces `jolla-devicelock-daemon-encsfa` and `-plugin-encsfa`). That is what makes Settings > Device lock show the Fingerprint section. Then restart the Settings app and lipstick, or reboot: device lock clients keep their socket to the old daemon, and until they reconnect the section stays hidden and the lock screen never asks for a finger. The first boot asks for the lock code before the sensor is used.
+
+Tested with Sailfish OS 5.2.0.22 on kernel 7.3 (SM6115, MicroArray sensor, TA `mafp`): two fingers enrolled from Settings, both unlock the phone on the lock screen after a sleep. Open: the match rate on the first try, the sensor interrupt (the daemon polls), and automatic recovery when the TA instance dies.
+
 ### Not solved yet
 
 - **Calls, SMS and mobile data on Qualcomm modems** on victara: the modem talks QMI (it needs `rmtfs` and `qrtr`), and Jolla's ofono is built without its QMI driver. The Pro1-X has them working with the Sailfish-patched upstream oFono, see [Modem](#modem-qualcomm-qrtr-pro1-x); its three oFono patches are not upstream anywhere yet.
@@ -1280,6 +1293,7 @@ This ABL refuses `fastboot boot`, so every kernel test is a flash of `boot_a`; k
 | Sensors behind a DSP | [No IIO devices at all](#no-iio-devices-at-all-the-sensors-are-behind-the-dsp-pro1-x) |
 | Settings pages, feature flags | [Patterns](#patterns), [Settings shows no sensor items](#settings-shows-no-sensor-items-sensorfwd-says-plugin-not-available) |
 | Modem firmware at runtime, A/B slot | [Firmware](#firmware), [Boot on an A/B bootloader](#boot-on-an-ab-android-bootloader-pro1-x) |
+| Fingerprint | [Fingerprint](#fingerprint) |
 
 
 ## 15. Credits
