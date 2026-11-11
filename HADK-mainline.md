@@ -1274,4 +1274,9 @@ This ABL refuses `fastboot boot`, so every kernel test is a flash of `boot_a`; k
 | Battery life | [Power](#power) |
 | Home encryption | [Encryption](#encryption), [kernel config](#kernel-config) |
 | Screenshots, browser | [Display and graphics](#display-and-graphics) |
-| Calls, SMS, data | [Not solved yet](#not-solved-yet) |
+| Calls, SMS, data | [Modem](#modem-qualcomm-qrtr-pro1-x) (Pro1-X); [Not solved yet](#not-solved-yet) (victara) |
+| Call audio | [Call audio on q6](#call-audio-on-qualcomm-dsp-audio-q6-pro1-x) |
+| Camera, video recording | [Camera and video](#camera-and-video-pro1-x) |
+| Sensors behind a DSP | [No IIO devices at all](#no-iio-devices-at-all-the-sensors-are-behind-the-dsp-pro1-x) |
+| Settings pages, feature flags | [Patterns](#patterns), [Settings shows no sensor items](#settings-shows-no-sensor-items-sensorfwd-says-plugin-not-available) |
+| Modem firmware at runtime, A/B slot | [Firmware](#firmware), [Boot on an A/B bootloader](#boot-on-an-ab-android-bootloader-pro1-x) |
