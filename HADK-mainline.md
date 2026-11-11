@@ -820,6 +820,45 @@ There were two causes:
 - The Bluetooth policy files (`xpolicy.conf.d/bluez5*.conf`) needed the same renames.
 - The droid-configs-device template needs the ohm `dbus_method` handlers (commit `aceec5c`). Without them ohmd answers PulseAudio's route change with "UnknownMethod", and A2DP is never used. Our pin `a9b3995` has them.
 
+#### PulseAudio 17 names UCM profiles differently (Pro1-X)
+
+With PulseAudio 16 and later a UCM profile is called `<Verb> (<devices>)`, for example `HiFi (Mic, Speaker)` or `Voice Call (Earpiece, Mic)`, not `HiFi`. The `card_profile_*` variables in `xpolicy.conf` must carry the full name as `pactl list cards` prints it, and a card name with spaces or parentheses must be quoted, or every `[device]` rule silently mis-matches. The symptom on the Pro1-X was a call that connected without audio: the policy asked for a profile "Voice Call" that did not exist, so the card stayed in HiFi.
+
+#### PulseAudio aborts: "Assertion 'dev == data->device' failed" (Pro1-X)
+
+Jolla's `pulseaudio 17.0+git1` asserts in `pa_alsa_ucm_set_port()` when two UCM verbs declare a device of the same name, which is what you get once you add a `Voice Call` verb beside `HiFi` with the same Speaker, Earpiece and Mic. Upstream fixed it in January 2024 (`ed3d4f08`, "alsa-ucm: Replace port device UCM context assertion with an error"). piggz's `pulseaudio 17.0+git2+master` build in `nemo:devel:hw:pine:dontbeevil` has the fix; the Pro1-X uses it.
+
+#### Rhythmic clicks on every route change: the policy loops (Pro1-X)
+
+With UCM every route (speaker, earpiece, headset) is its own card profile, so a route change destroys the sink and creates a new one. Sailfish's `module-policy-enforcement` reports device availability to ohmd for every `[device]` rule; the sink removal is reported as "all built-in devices gone", ohmd reroutes, the new sink is reported back, ohmd reroutes again: the two profiles alternate every 0.18 s and you hear the codec clicking. Android-based ports never see it because the droid card has one profile and routes by port. Fix: the `disable_notify` flag on every `[device]` rule that matches the built-in card's sink:
+
+```
+[device]
+type  = ihfandheadset
+sink  = alsa.card_name@equals:$card_name
+ports = alsa.card_name@equals:$card_name->$sink_headset
+flags = disable_notify, $sink_port_change_delay
+```
+
+Found with `dbus-monitor --system` (the `com.nokia.policy` info signals) and `pactl subscribe` side by side.
+
+#### No UI sounds, no camera shutter: ngfd started before PulseAudio (Pro1-X)
+
+ngfd's canberra and tonegen backends connect to PulseAudio once at startup and never reconnect. Anything that delays PulseAudio (an ExecStartPre that waits for the sound card, a re-probe hook) lets ngfd start first and stay silent. Drop-in `ngfd.service.d/10-<device>.conf` in the user units: `[Unit]` `After=pulseaudio.service` and `Wants=pulseaudio.service`.
+
+#### Call audio on Qualcomm DSP audio (q6) (Pro1-X)
+
+Expect this to be the hardest part of a Qualcomm port. Mainline has the q6 ASoC drivers for media and no voice path. What works on the Pro1-X (earpiece and speaker, both directions, volume keys set the call volume; Bluetooth and the wired headset in calls still open):
+
+1. **Kernel:** Stephan Gerhold's out-of-tree `q6voice` driver (CVP, CVS, MVM) with the voice front end `VoiceMMode1`, carried in the device kernel series (`CONFIG_SND_SOC_QDSP6_Q6VOICE=m`). It is his to upstream; do not send it separately.
+2. **A `Voice Call` UCM verb** whose enable sequence runs a helper, and a `HiFi` verb for everything else. Sailfish's audio policy selects the verb through the `card_profile_voicecall*` variables (full names, see above).
+3. **The helper** (`pro1x-voice-call`, from nyymi609's NixOS port, with oFono's `VoiceCallManager` instead of ModemManager): while oFono reports an active call it holds the hostless voice PCM open, which starts the DSP voice session, and plays and records silent keep-alive streams on the codec back ends so they stay powered. postmarketOS's `q6voiced` is the same idea.
+4. **The keep-alive streams must belong to the call policy group.** Sailfish's policy classifies every stream; `gst-launch-1.0` is a "player", so each keep-alive moved the route to the speaker, the call moved it back, the sink vanished, the helper restarted it: a loop, heard as clicks. Tag the streams with a custom property and add an `xpolicy.conf` `[stream]` rule that maps it to group `call` (`media.name` is overwritten by the client library; custom properties survive). Verify `policy.group = "call"` on the sink input with `pactl list sink-inputs`.
+5. **The codec DMA back ends stall on their first start in the call verb**: the playback pointer stays at 0, capture delivers zeros, the call is silent both ways although every mixer is set. One suspend and resume of the sink and the source after the keep-alive streams run restarts them; the helper does it once.
+6. **Volume keys:** map Sailfish's call volume steps onto the codec's digital gain control, since PulseAudio sees no volume control on the DSP voice path.
+
+The package with the helper, the verb and a README with the measurements is `packages/qx1050-voicecall` in the Pro1-X port. A pop or click from the speaker at stream start and stop is the amplifier switching before the codec; fix it in the amplifier driver (on after the codec, off before), not in userspace.
+
 ### Display and graphics
 
 #### There's no Mesa driver for your GPU
