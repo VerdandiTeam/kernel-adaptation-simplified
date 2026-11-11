@@ -11,10 +11,12 @@ The regular [HADK](https://hadk.sailfishos.org/) builds Sailfish OS on top of An
 
 - graphics through Mesa
 - audio through ALSA and PulseAudio
-- sensors through IIO
+- sensors through IIO, or on Qualcomm phones with a Sensor Core through the ADSP's sensor service (see [Sensors](#sensors))
 - vibration through the kernel's ff-memless input interface
 
 The rest is the same as in the HADK: the Platform SDK, `build_packages.sh`, mic and kickstarts, and mostly the same package names. Instead of an Android tree you keep five small repos.
+
+Two ports fed this guide. The walkthrough and most of chapter 13 come from victara (Moto X 2014, MSM8974, armv7hl, sensors on IIO, a 2014 bootloader). Entries marked **(Pro1-X)** come from the F(x)tec Pro1-X (Qualcomm SM6115, aarch64, Android bootloader with A/B slots, Sailfish OS 5.2.0.22 on kernel 7.3): the Qualcomm modem, sensors behind the DSP, call audio, camera and video. That port is not yet packaged as in chapter 3. Its config files, patches and package sources are at `github.com/moWerk/sailfishos-pro1x-mainline` and were tested installed by hand, so take file contents from it, not packaging.
 
 How this guide is laid out:
 
@@ -55,7 +57,7 @@ Each repo is mostly a spec file plus an upstream template, pulled in as a git su
 | Repo | Submodule | Upstream |
 |---|---|---|
 | kernel-adaptation | `linux` | your kernel tree |
-| kernel-adaptation | `kernel-adaptation-simplified` | `github.com/VerdandiTeam/kernel-adaptation-simplified`, based on HelloVolla's. This copy has `helpers/build_packages.sh`, the HADK build script adapted for mainline ports. |
+| kernel-adaptation | `kernel-adaptation-simplified` | `github.com/sailfishos-open/kernel-adaptation-simplified`, based on HelloVolla's. It carries `helpers/build_packages.sh`, the HADK build script adapted for mainline ports. |
 | droid-hal-img-boot | `initrd` | `github.com/mer-hybris/hybris-initrd` |
 | droid-config | `droid-configs-device` | `github.com/mer-hybris/droid-hal-configs` |
 | droid-hal-version | `droid-hal-version` | `github.com/mer-hybris/droid-hal-version` |
@@ -112,7 +114,7 @@ Create the repo:
 mkdir -p $ANDROID_ROOT/kernel-adaptation-$DEVICE && cd $ANDROID_ROOT/kernel-adaptation-$DEVICE
 git init
 git submodule add <your kernel git url> linux
-git submodule add https://github.com/VerdandiTeam/kernel-adaptation-simplified kernel-adaptation-simplified
+git submodule add https://github.com/sailfishos-open/kernel-adaptation-simplified kernel-adaptation-simplified
 cp <a kernel config that boots on your device> sfos-${DEVICE}_defconfig
 mkdir rpm ramdisk
 touch ramdisk/.keep
