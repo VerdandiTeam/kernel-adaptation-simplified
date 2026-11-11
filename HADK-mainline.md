@@ -1107,6 +1107,43 @@ transformation_matrix = "1,0,0,0,1,0,0,0,1"
 
 The stock adaptor couldn't read values from buffered IIO devices, so we use a sensorfw fork (affenull2345's `iio` branch, plus our fixes).
 
+#### No IIO devices at all: the sensors are behind the DSP (Pro1-X)
+
+On Qualcomm SoCs with a Sensor Core (SM6115 and relatives) the accelerometer, gyroscope, magnetometer, light and proximity sensors are not on a bus the kernel drives. They hang off the ADSP's Sensor Subsystem (SSC) and are reached over FastRPC and QMI; the only IIO devices are the PMIC's ADCs. What the Pro1-X runs instead, bottom up:
+
+1. **hexagonrpcd** (`github.com/linux-msm/hexagonrpc`) serves the sensor registry and configuration to the ADSP from a directory tree. It needs the fork with write support and the sensor registry interface (pull request 27 plus two patches by nyymi609), the registry data from a working port of the same device (the NixOS port's `hexagonfs` tree here), a writable copy of the registry (the ADSP rewrites it), the platform name the ADSP asks for (`QRD` selects the configs for this board) and the `/dev/fastrpc-adsp` node, which appears late in boot. Kernel side: the fastrpc and SMP2P fixes from the Lenovo TB-J606L port (haltia-de), or the ADSP's sensor process crashes at the first resume from suspend.
+2. **libssc** (Dylan Van Assche, `codeberg.org/DylanVanAssche/libssc`) is the client library; `ssccli --sensor accelerometer` is the first test. It needs libqmi-glib with QRTR, libqrtr-glib and protobuf-c, which Sailfish lacks (the port packages protobuf-c).
+3. **sensorfw adaptors**, one plugin per sensor (`libssc<sensor>adaptor-qt5.so`), built against `sensorfw-qt5-devel`; no sensorfw fork needed. Mapped in `/etc/sensorfw/sensord.conf.d/60-<device>-ssc.conf` under `[plugins]`. Readings arrive already in the phone frame, so start with the identity matrix and verify by tilting; a mount matrix copied from an IIO-based stack inverted the axes here.
+
+Hazards: a client that crashes the ADSP in a loop can freeze the phone when remoteproc recovery is on; with recovery off, a crash takes the ADSP and with it audio down until reboot. Supervise the first run. A client that blocks while the sensor service is missing blocks sensorfwd's main loop and with it lipstick's start (libssc 0.4.4 did; patched in the port).
+
+Package sources and READMEs: `packages/hexagonrpc`, `packages/libssc`, `packages/protobuf-c`, `packages/sensorfw-qt5-ssc` in the Pro1-X port. Tested: Sailfish OS 5.2.0.22, kernel 7.3: auto-rotation, auto brightness, proximity in calls, compass, and the Sensor Core's step counter through its own adaptor.
+
+#### Settings shows no sensor items, sensorfwd says "plugin not available"
+
+sensorfwd enables a sensor only when its hardware feature is declared: `20-sensors-default.conf` `[available]` maps each sensor to a `Feature_*` flag that ssu-sysinfo reads from `/usr/share/csd/settings.d/hw-settings.ini`. Without that file only Suspend and Reboot exist. The same list gates Settings items (auto brightness needs `LightSensor=1`) and the status-bar battery indicator (`Battery=1`). A missing declaration looks exactly like a missing driver. This applies to IIO sensors too. From the Pro1-X file:
+
+```ini
+[features]
+GSensor=1
+Gyro=1
+ECompass=1
+LightSensor=1
+ProxSensor=1
+Battery=1
+Hall=1
+
+[LED]
+LedType=RGB
+
+[SIM]
+ModemCount=1
+```
+
+#### Apps log "Could not connect to the <type> sensor backend" while sensorfwd works
+
+QtSensors' sensorfw plugin registers its backends only from `/etc/xdg/QtProject/Sensors.conf` (`[Default]`, `QAccelerometer=sensorfw.accelerometer` and so on). droid-hal-configs ships it; a port that assembles its configuration another way has to.
+
 ### Power
 
 #### The CPU keeps jumping to its highest frequency
