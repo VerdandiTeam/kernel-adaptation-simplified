@@ -11,10 +11,12 @@ The regular [HADK](https://hadk.sailfishos.org/) builds Sailfish OS on top of An
 
 - graphics through Mesa
 - audio through ALSA and PulseAudio
-- sensors through IIO
+- sensors through IIO, or on Qualcomm phones with a Sensor Core through the ADSP's sensor service (see [Sensors](#sensors))
 - vibration through the kernel's ff-memless input interface
 
 The rest is the same as in the HADK: the Platform SDK, `build_packages.sh`, mic and kickstarts, and mostly the same package names. Instead of an Android tree you keep five small repos.
+
+Some entries come from a second port, on a Qualcomm SM6115 phone with an Android A/B bootloader (aarch64, Sailfish OS 5.2.0.22 on kernel 7.3): the Qualcomm modem, sensors behind the DSP, call audio, camera and video, fingerprint. They are written for that class of hardware. That port is not yet packaged as in chapter 3; its config files, patches and package sources (see Credits) were tested installed by hand, so take file contents from it, not packaging.
 
 How this guide is laid out:
 
@@ -55,7 +57,7 @@ Each repo is mostly a spec file plus an upstream template, pulled in as a git su
 | Repo | Submodule | Upstream |
 |---|---|---|
 | kernel-adaptation | `linux` | your kernel tree |
-| kernel-adaptation | `kernel-adaptation-simplified` | `github.com/VerdandiTeam/kernel-adaptation-simplified`, based on HelloVolla's. This copy has `helpers/build_packages.sh`, the HADK build script adapted for mainline ports. |
+| kernel-adaptation | `kernel-adaptation-simplified` | `github.com/sailfishos-open/kernel-adaptation-simplified`, based on HelloVolla's. It carries `helpers/build_packages.sh`, the HADK build script adapted for mainline ports. |
 | droid-hal-img-boot | `initrd` | `github.com/mer-hybris/hybris-initrd` |
 | droid-config | `droid-configs-device` | `github.com/mer-hybris/droid-hal-configs` |
 | droid-hal-version | `droid-hal-version` | `github.com/mer-hybris/droid-hal-version` |
@@ -112,7 +114,7 @@ Create the repo:
 mkdir -p $ANDROID_ROOT/kernel-adaptation-$DEVICE && cd $ANDROID_ROOT/kernel-adaptation-$DEVICE
 git init
 git submodule add <your kernel git url> linux
-git submodule add https://github.com/VerdandiTeam/kernel-adaptation-simplified kernel-adaptation-simplified
+git submodule add https://github.com/sailfishos-open/kernel-adaptation-simplified kernel-adaptation-simplified
 cp <a kernel config that boots on your device> sfos-${DEVICE}_defconfig
 mkdir rpm ramdisk
 touch ramdisk/.keep
@@ -193,6 +195,25 @@ The checker doesn't tell you about these, but you need them too:
 | `# CONFIG_BTRFS_FS is not set`, `# CONFIG_CRC_OPTIMIZATIONS is not set`, `# CONFIG_DM_INTEGRITY is not set` | armv7 on 7.x kernels: these pull in NEON code that doesn't build under the SDK's scratchbox2. |
 | `CONFIG_BLK_DEV_DM=y`, `CONFIG_DM_CRYPT=y` | The initrd mounts root and home from LVM. DM_CRYPT is for home encryption. |
 | `CONFIG_USB_CONFIGFS=y`, `CONFIG_USB_CONFIGFS_RNDIS=y` | USB networking that works without modules. |
+
+On a 7.x kernel these matter too. Each came from a mer-kernel-check error or from a Sailfish service failing on a 7.3 kernel with Sailfish OS 5.2:
+
+| Option | Why |
+|---|---|
+| `CONFIG_PM_AUTOSLEEP=y` | mce suspends the phone by writing to `/sys/power/autosleep`. Without it the file does not exist, mce still reports "Autosuspend policy: enabled", and the phone never suspends: screen off is CPU idle only. arm64 defconfig leaves it off. Check the success count in `/sys/kernel/debug/suspend_stats`. |
+| `CONFIG_MEMCG_V1=y`, `CONFIG_CPUSETS_V1=y` | Sailfish's tmpfiles writes `/sys/fs/cgroup/memory/noswapping`. Without the cgroup v1 hierarchies `systemd-tmpfiles-setup` fails, `user@.service` never starts, and the boot ends without a UI. |
+| `CONFIG_QUOTA_NETLINK_INTERFACE=y`, `CONFIG_QFMT_V2=y` | `quota_nld.service` fails without them. |
+| `CONFIG_NETFILTER_XTABLES_LEGACY=y`, `CONFIG_IP_NF_IPTABLES_LEGACY`, `CONFIG_IP6_NF_IPTABLES_LEGACY`, with the filter, mangle, raw, nat, REJECT and rpfilter pieces | connman's firewall and tethering use the legacy iptables tables, which 7.x kernels hide behind these options. `=m` is fine, iptables loads them on demand. |
+| `CONFIG_NET_L3_MASTER_DEV=y`, `CONFIG_INET_AH`, `CONFIG_INET_ESP`, `CONFIG_INET_IPCOMP`, `CONFIG_INET6_AH`, `CONFIG_INET6_ESP`, `CONFIG_PPP*`, `CONFIG_PPPOE`, `CONFIG_L2TP*` | the VPN plugins Sailfish ships. |
+| `CONFIG_BT_RFCOMM`, `CONFIG_BT_BNEP`, and `CONFIG_BT_LE=y` on arm64 | bluez profiles. arm64 defconfig turns Bluetooth LE off, which leaves no BLE at all. |
+| `CONFIG_NLS_UTF8=y` | vfat SD cards. |
+| `CONFIG_QRTR=y`, `CONFIG_QRTR_SMD=y`, `CONFIG_QCOM_PD_MAPPER=y` (Qualcomm) | the modem and the DSPs offer their services over Qualcomm's IPC router (QRTR); its name service and the protection-domain mapper, which tells the DSPs where their services live, are in the kernel now. Built in, they exist before the remoteprocs start, and no userspace `pd-mapper` is needed (an old one that is still started misses firmware mounted late). |
+| `CONFIG_ZRAM=m` | Sailfish's `zram` package gives swap in RAM. Optional. |
+
+Two rules the options do not express:
+
+- **Everything between the storage and the panel is built in; drivers that load a file at probe are modules.** With an initrd that loads no modules, the storage controller and its PHY, the clock controllers, interconnect, RPM, pinctrl, DRM and the panel, and their I2C and DMA dependencies have to be `=y`. On an SM6115 the display and GPU clock controllers, the GENI I2C controller and the GPI DMA as modules made mdss, adreno and the SMMU hit the deferred-probe timeout before udev could load them: the panel never lit and touch probed 47 s late. The other way round, a touch controller that fetches its configuration through the firmware loader (`goodix_9286_cfg.bin`) has to be a module, or the request fails before root is mounted.
+- **If you generate the config, check that every line survived.** Kconfig silently demotes `=y` to `=m` or drops an option whose dependency is missing, and a config resolved on the unpatched tree loses every option the device patches introduce. One way that works: build `arm64 defconfig` plus a device fragment plus a Sailfish fragment, runs `olddefconfig` on the patched tree, then fails the build on any fragment line that does not appear verbatim in `.config`. The first kernel without that check had lost the keyboard, haptics, battery and camera drivers.
 
 ### Build it
 
@@ -400,6 +421,8 @@ Requires: alsa-ucm-conf
 
 Keep the rest: `droid-hal-<device>-img-boot`, the `droid-config-<device>-*` packages, `droid-hal-version-<device>`, `usb-moded`, `mce-plugin-libhybris` and so on.
 
+Jolla's per-device and consumer patterns pull several Settings pages that the common pattern does not. Add the ones your device needs: `jolla-settings-networking-multisim` (SIM cards), `jolla-settings-system-orientation` (Display > Orientation, the orientation lock in the top menu, rotating home screen), `jolla-settings-system-sideloading`. `jolla-settings-system-flashlight` works on mainline with a provider in place of droidmedia's: Jolla's provider with the Android camera call replaced by the LED's torch mode (`sysfs-flashlight`).
+
 - `pulseaudio-module-keepalive`: Sailfish's PulseAudio config loads `module-keepalive`. droid-configs pulls this package in for native builds, in place of `pulseaudio-modules-droid`.
 - Image type: because the pattern requires the boot image package and not the kernel package, `build_packages.sh -i` builds a loop image, which your pack script turns into flashable images. A pattern that requires `kernel-adaptation-<device>` gets a rootfs tarball instead.
 
@@ -425,6 +448,8 @@ QT_QPA_EGLFS_INTEGRATION=eglfs_kms
 QT_QPA_EGLFS_PHYSICAL_WIDTH=<panel width in mm>
 QT_QPA_EGLFS_PHYSICAL_HEIGHT=<panel height in mm>
 ```
+
+A KMS port also sets `QT_QPA_EGLFS_KMS_CONFIG=/etc/eglfs-config.json` there, with `device` `/dev/dri/card0` and `hwcursor` false.
 
 ### Kickstart
 
@@ -610,6 +635,14 @@ On hybris ports, Android's init creates the USB gadget, and usb-moded only switc
    interface = usb0
    ```
 
+3. **FunctionFS for MTP.** The `ffs.mtp` function only works when FunctionFS is mounted where buteo-mtp expects it, before usb-moded starts. Do it in the same oneshot:
+
+   **DEVICE**
+   ```sh
+   mkdir -p /dev/mtp
+   mount -t functionfs -o uid=0,gid=$(getent group mtp | cut -d: -f3),rmode=0770,fmode=0660 mtp /dev/mtp
+   ```
+
 Also set up cable detection ([usb-moded doesn't notice the cable](#usb-moded-doesnt-notice-the-cable-or-always-picks-charging-only)). Then turn on developer mode in Settings, and the device is at `192.168.2.15` over USB:
 
 **HOST**
@@ -647,6 +680,8 @@ extcon_tracking = 1
 
 Find the right one with `cat /sys/class/extcon/*/name` and `state`, with the cable in and out. The extconN numbers aren't guaranteed to stay the same, so we also disabled the unused extcon device in the device tree.
 
+The other way: a charger driver that registers a power supply named `usb` with `online` and `type` (`USB`, `USB_DCP`, `USB_CDP`). usb-moded's default tracking reads it, with no `[udev]` section at all. A Type-C port manager supply (tcpm) does not report a PC host as `online`, so point usb-moded at the charger's supply, not the Type-C one.
+
 ### Charging and battery
 
 #### No battery percentage
@@ -681,6 +716,8 @@ DisableValue=0
 
 victara's charger driver had no such switch, so we gave it a `charging_enabled` module parameter.
 
+mce looks for the control file once, at start. If the driver that provides it loads later, the charge limit silently disappears from Settings. Order mce after it, for example an `ExecStartPre` drop-in on `mce.service` that waits for the path (30 s is enough). Two more things: register a power supply named `usb` with `online` and `type` even when the charger driver only manages the input current, because usb-moded and mce read it, and let the battery supply follow it (`supplied_to`), so a plug change is reported at once instead of at the next poll; and report `Not charging` when input is present but the limit stopped the current, so the UI does not say charging while nothing flows.
+
 ### Notification LED
 
 #### The LED never lights up
@@ -695,11 +732,17 @@ LedDirectory=/sys/class/leds/<led name>
 
 victara's LED is a single green one, so we use `white`. Don't give the LED a `linux,default-trigger` in the device tree, because mce wants to drive it itself.
 
+#### The LED is one multicolor device
+
+Mainline device trees describe an RGB indicator as one LED class device of the multicolor framework (`rgb:status` with `multi_intensity` and `multi_index`), while every backend of mce-plugin-libhybris expects one device per colour (`vanilla` takes `RedDirectory`, `GreenDirectory`, `BlueDirectory`). Either split the device tree into three LEDs, or add a `multicolor` backend to mce-plugin-libhybris's sysfs-led (`BackEnd=multicolor`, `LedDirectory=/sys/class/leds/rgb:status`), which writes the colour to `multi_intensity`, switches with `brightness`, and blinks with its own timer, because the PMIC LPG's hardware blink gives every channel the same duty cycle out of phase and a green blink shows a red, green, blue sweep. Such a backend exists as a patch in the SM6115 port; it is not upstream.
+
 ### Vibration
 
 #### ngfd logs "Vibra upload effect: No space left on device"
 
 ngfd's ff-memless config uploads more effects (17) than the kernel's ff-memless has slots (16). We raised `FF_MEMLESS_EFFECTS` to 64 in `drivers/input/ff-memless.c`.
+
+The other way keeps the stock kernel and trims the list instead: a file whose name ends in `ffmemless.ini` and sorts after `50-` (`/usr/share/ngfd/plugins.d/60-<device>-ffmemless.ini`) with `[ffmemless] supported_effects` listing 12 names or fewer (one of the stock 17 is a typo, `drag_boundary_drag_end`). Files with other names are not merged as plugin parameters, and `NGF_FFMEMLESS_SETTINGS` overrides only parameters, not the list. It also uses `libngf-qt5-qtfeedback` as the Qt feedback plugin instead of `qt5-feedback-haptics-ffmemless`, which bypasses ngfd and uploads 2-3 effects per process into the same 16 slots, and disables theme effects when an upload returns id 0 (which happens when ngfd died first). The trade-off: the kernel bump keeps the stock effect list and the Qt plugin's per-process effects; the trimmed list keeps a stock kernel. Motor strength is a driver parameter either way: an accepted `FF_RUMBLE` can still be too weak to feel. For the aw86224 haptics driver, `options aw86224 d2s_gain=7 drv2_lvl=100` in `/etc/modprobe.d/` is a setting that works.
 
 #### Touch feedback is too weak to feel
 
@@ -789,6 +832,45 @@ There were two causes:
 - The Bluetooth policy files (`xpolicy.conf.d/bluez5*.conf`) needed the same renames.
 - The droid-configs-device template needs the ohm `dbus_method` handlers (commit `aceec5c`). Without them ohmd answers PulseAudio's route change with "UnknownMethod", and A2DP is never used. Our pin `a9b3995` has them.
 
+#### PulseAudio 17 names UCM profiles differently
+
+With PulseAudio 16 and later a UCM profile is called `<Verb> (<devices>)`, for example `HiFi (Mic, Speaker)` or `Voice Call (Earpiece, Mic)`, not `HiFi`. The `card_profile_*` variables in `xpolicy.conf` must carry the full name as `pactl list cards` prints it, and a card name with spaces or parentheses must be quoted, or every `[device]` rule silently mis-matches. The symptom was a call that connected without audio: the policy asked for a profile "Voice Call" that did not exist, so the card stayed in HiFi.
+
+#### PulseAudio aborts: "Assertion 'dev == data->device' failed"
+
+Jolla's `pulseaudio 17.0+git1` asserts in `pa_alsa_ucm_set_port()` when two UCM verbs declare a device of the same name, which is what you get once you add a `Voice Call` verb beside `HiFi` with the same Speaker, Earpiece and Mic. Upstream fixed it in January 2024 (`ed3d4f08`, "alsa-ucm: Replace port device UCM context assertion with an error"). piggz's `pulseaudio 17.0+git2+master` build in `nemo:devel:hw:pine:dontbeevil` has the fix.
+
+#### Rhythmic clicks on every route change: the policy loops
+
+With UCM every route (speaker, earpiece, headset) is its own card profile, so a route change destroys the sink and creates a new one. Sailfish's `module-policy-enforcement` reports device availability to ohmd for every `[device]` rule; the sink removal is reported as "all built-in devices gone", ohmd reroutes, the new sink is reported back, ohmd reroutes again: the two profiles alternate every 0.18 s and you hear the codec clicking. Android-based ports never see it because the droid card has one profile and routes by port. Fix: the `disable_notify` flag on every `[device]` rule that matches the built-in card's sink:
+
+```
+[device]
+type  = ihfandheadset
+sink  = alsa.card_name@equals:$card_name
+ports = alsa.card_name@equals:$card_name->$sink_headset
+flags = disable_notify, $sink_port_change_delay
+```
+
+Found with `dbus-monitor --system` (the `com.nokia.policy` info signals) and `pactl subscribe` side by side.
+
+#### No UI sounds, no camera shutter: ngfd started before PulseAudio
+
+ngfd's canberra and tonegen backends connect to PulseAudio once at startup and never reconnect. Anything that delays PulseAudio (an ExecStartPre that waits for the sound card, a re-probe hook) lets ngfd start first and stay silent. Drop-in `ngfd.service.d/10-<device>.conf` in the user units: `[Unit]` `After=pulseaudio.service` and `Wants=pulseaudio.service`.
+
+#### Call audio on Qualcomm DSP audio (q6)
+
+Expect this to be the hardest part of a Qualcomm port. Mainline has the q6 ASoC drivers for media and no voice path. What works (earpiece and speaker, both directions, volume keys set the call volume; Bluetooth and the wired headset in calls still open):
+
+1. **Kernel:** Stephan Gerhold's out-of-tree `q6voice` driver (CVP, CVS, MVM) with the voice front end `VoiceMMode1`, carried in the device kernel series (`CONFIG_SND_SOC_QDSP6_Q6VOICE=m`). It is his to upstream; do not send it separately.
+2. **A `Voice Call` UCM verb** whose enable sequence runs a helper, and a `HiFi` verb for everything else. Sailfish's audio policy selects the verb through the `card_profile_voicecall*` variables (full names, see above).
+3. **The helper** (a small daemon from nyymi609's NixOS port of the same SoC, with oFono's `VoiceCallManager` instead of ModemManager): while oFono reports an active call it holds the hostless voice PCM open, which starts the DSP voice session, and plays and records silent keep-alive streams on the codec back ends so they stay powered. postmarketOS's `q6voiced` is the same idea.
+4. **The keep-alive streams must belong to the call policy group.** Sailfish's policy classifies every stream; `gst-launch-1.0` is a "player", so each keep-alive moved the route to the speaker, the call moved it back, the sink vanished, the helper restarted it: a loop, heard as clicks. Tag the streams with a custom property and add an `xpolicy.conf` `[stream]` rule that maps it to group `call` (`media.name` is overwritten by the client library; custom properties survive). Verify `policy.group = "call"` on the sink input with `pactl list sink-inputs`.
+5. **The codec DMA back ends stall on their first start in the call verb**: the playback pointer stays at 0, capture delivers zeros, the call is silent both ways although every mixer is set. One suspend and resume of the sink and the source after the keep-alive streams run restarts them; the helper does it once.
+6. **Volume keys:** map Sailfish's call volume steps onto the codec's digital gain control, since PulseAudio sees no volume control on the DSP voice path.
+
+Package the helper, the verb and the measurements together with a README (the SM6115 port has such a package). A pop or click from the speaker at stream start and stop is the amplifier switching before the codec; fix it in the amplifier driver (on after the codec, off before), not in userspace.
+
 ### Display and graphics
 
 #### There's no Mesa driver for your GPU
@@ -852,6 +934,148 @@ WantedBy=sysinit.target
 - The kernel tries `firmware_class.path` first and `/lib/firmware` after it, so packaged and partition firmware work side by side.
 - It's the same idea as postmarketOS's msm-firmware-loader.
 
+#### The modem and the DSPs fetch files at runtime (Qualcomm)
+
+`/lib/firmware` is only the first half. Once the modem runs, it asks the host for more over two channels, and Sailfish OS provides neither:
+
+- **rmtfs** serves the modem's persistent file system (EFS, the `modemst1`, `modemst2`, `fsg` and `fsc` partitions) over shared memory. Never let anything write those partitions: they hold the IMEI and the per-unit calibration. Run rmtfs read-only on the partitions (`-r -P`; then everything the modem learns is lost at every boot and every satellite positioning (GNSS) start is a cold start), or on files seeded once from the partitions (`-o /var/lib/rmtfs`, a root-only directory; the better way). With `-s` rmtfs also starts the modem remoteproc itself once it serves.
+- **tqftpserv** answers the modem's file requests (trivial FTP over QRTR, Qualcomm's IPC router). It maps `/readonly/firmware/image/...` to the remoteproc's `firmware-name` directory under `/lib/firmware`. At every start the modem asks for its carrier configuration there (MCFG, one file set per hardware and per carrier): `modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig` and `mcfg_sw/mbn_sw.dig`. Missing, tqftpserv logs `unable to open ..., reject` and the modem runs on defaults: calls and data still work, GNSS tracks no satellite at all.
+
+Both come from `github.com/linux-msm` (`rmtfs`, `tqftpserv`, and `qrtr` for `qrtr-lookup`); package them as RPMs. Only these two daemons are still needed: the QRTR name service and the protection-domain mapper are in the kernel (`CONFIG_QRTR`, `CONFIG_QCOM_PD_MAPPER`). Guides that list four daemons are from 2021. If your firmware lives on the mounted partition rather than under `/lib/firmware`, check where your tqftpserv build looks; keeping the modem firmware under `/lib/firmware` is simplest.
+
+The MCFG files are on the `modem` partition, which Android mounts at `/vendor/firmware_mnt`. Mount it read-only and bind its `image/modem_pr` next to `modem.mbn` before tqftpserv starts, and wait for the partition link, because early in boot udev may not have created it yet:
+
+**DEVICE**
+```sh
+fw=/lib/firmware/qcom/<soc>/<vendor>/<device>   # where firmware-name points
+mnt=/run/<device>/modem
+slot=$(sed -n 's/.*androidboot.slot_suffix=\(_[ab]\).*/\1/p' /proc/cmdline)
+dev=/dev/disk/by-partlabel/modem${slot:-_a}
+mkdir -p $mnt $fw/modem_pr
+for i in $(seq 1 30); do [ -e $dev ] && break; sleep 1; done
+mountpoint -q $mnt || mount -t vfat -o ro,nodev,nosuid,noexec $dev $mnt
+mountpoint -q $fw/modem_pr || mount --bind $mnt/image/modem_pr $fw/modem_pr
+```
+
+The rmtfs unit from the sources has `ConditionPathExists=/dev/qcom_rmtfs_mem1`, which is not there yet when the unit is scheduled, so the service is silently skipped. Clear the condition and wait for the node instead:
+
+```ini
+[Unit]
+ConditionPathExists=
+StartLimitIntervalSec=0
+
+[Service]
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 180); do [ -e /dev/qcom_rmtfs_mem1 ] && exit 0; sleep 1; done; exit 1'
+ExecStart=
+ExecStart=/usr/bin/rmtfs -o /var/lib/rmtfs -s
+TimeoutStartSec=240
+```
+
+Two things follow from this chain:
+
+- **Wi-Fi depends on it.** On WCN3990-class chips (ath10k_snoc) Wi-Fi only comes up after the modem remoteproc, rmtfs and tqftpserv run. Debug a missing wlan0 from the modem side first.
+- **`/sys/class/remoteproc/*/recovery` is a safety switch.** With recovery enabled, a client that crashes a DSP in a loop can freeze the phone; disabled, a crash leaves that DSP and everything on it (audio on the ADSP) down until reboot. Choose per experiment and check the default first.
+
+Tested with Sailfish OS 5.2.0.22, kernel 7.3, modem firmware MPSS.HA.1.1 (MPSS is the modem subsystem's firmware family). Before the carrier configuration was mounted the modem heard no satellite; after it, satellites were tracked at the same spot and the modem kept its file system across boots.
+
+### Modem (Qualcomm, QRTR)
+
+Calls, SMS and mobile data work on an SM6115 (modem firmware MPSS.HA.1.1) with Sailfish OS 5.2.0.22 on kernel 7.3: data with ping and HTTPS, calls both ways including from suspend, SMS both ways. The modem has no USB side. Everything that configures it goes over Qualcomm's modem protocol (QMI: messages to named services, each with a short name) carried by the IPC router (QRTR), and the data packets run through a hardware block called the IP Accelerator (IPA), which the modem and the kernel share.
+
+#### Kernel and firmware
+
+`CONFIG_QRTR=y`, `CONFIG_QRTR_SMD=y`, `CONFIG_QCOM_PD_MAPPER=y`, `CONFIG_QCOM_Q6V5_PAS=m` for the remoteproc (the DSPs are started through TrustZone's Peripheral Authentication Service), `CONFIG_QCOM_IPA=m` and an IPA node in the device tree: `rmnet_ipa0` only exists with it, and oFono builds its modem from that netdev. Then the rmtfs and tqftpserv chain from [Firmware](#the-modem-and-the-dsps-fetch-files-at-runtime-qualcomm). `qrtr-lookup` lists the modem's services once it is up; `qmicli -d qrtr://0 --dms-get-ids` asks the modem's device management service (DMS) for its identity, the IMEI among it, without any modem manager. qmicli names every service by that short name, so the rest of this chapter does too: DMS (device management), UIM (the SIM card), NAS (network registration), WDS (data connections), WDA (data format), DPM (data port mapping).
+
+#### Sailfish's oFono has no QRTR, the Sailfish-patched upstream one has
+
+Jolla's oFono 1.29 has `qmimodem` disabled and its `gobi` plugin speaks QMI only over USB (QMUX framing), never over QRTR. Upstream oFono 2.9 and later has `plugins/qrtrqmi.c`, and `github.com/sailfishos-native/ofono` is upstream 2.12 plus Jolla's Sailfish patches (the slot manager, the D-Bus interfaces lipstick and Settings talk to). The PinePhone port builds it as `ofono-2.12.0+git1` with `ell-0.70` in `nemo:devel:hw:pine:dontbeevil`, and that build runs with the three patches below on top.
+
+oFono 2.x takes a deny-list, never the 1.x `--plugin` allow-list; `qrtrqmi`, `qmimodem`, the slot manager and provisioning are built in. `/var/lib/environment/ofono/<device>.conf`:
+
+```sh
+OFONO_ARGS=--noplugin=aml,phonesim
+```
+
+`aml` is Jolla's 1.29-era plugin left behind by sailfish-aml and fails to load against 2.x; `phonesim` wants a config file that does not exist.
+
+oFono's provisioning service runs as the Android-era `radio` user. Create it in your kickstart `%post`:
+
+```sh
+getent group radio >/dev/null || groupadd -g 1001 radio
+getent passwd radio >/dev/null || useradd radio --uid 1001 -g radio -r -s /sbin/nologin
+```
+
+#### oFono sees the SIM, Settings doesn't
+
+`org.ofono.Manager.GetModems` lists the modem online, `SimManager` says present, the network is registered, and still Settings shows no SIM, connman has no cellular technology and the status bar no signal. Settings, connman, the status bar and commhistoryd read `org.nemomobile.ofono.ModemManager`, the Sailfish slot manager, which lists only modems a plugin registers as slots (`ofono_slot_driver_register`). Jolla's patch set adds that to `gobi` only.
+
+Add a slot driver to `plugins/qrtrqmi.c`, modelled on sailfishos-native's patch `0010-Add-slot-support-to-the-gobi-plugin`: register the driver in probe, add one slot once the modem has answered the identity query (DMS GET_IDS, which returns the IMEI; a placeholder if it does not), follow the SIM atom through `ofono_watch` so an absent SIM ends up ABSENT instead of leaving the manager unready forever. About 135 lines; it applies on 2.12 and 2.13. Check with:
+
+**DEVICE**
+```sh
+dbus-send --system --print-reply --dest=org.ofono / org.nemomobile.ofono.ModemManager.GetAll
+```
+
+`AvailableModems` and `EnabledModems` must list your modem.
+
+#### The SIM stays "detected", nothing registers
+
+Some modem firmwares do not keep the SIM card's provisioning session, the one that tells the modem which card application to register with (UIM primary GW session, GW for the GSM/WCDMA application). The card shows present, PIN state `not-initialized`, no registration ever. Activate the session before oFono, every boot, idempotently (postmarketOS's `msm-modem-uim-selection` does the same):
+
+**DEVICE**
+```sh
+status=$(qmicli -d qrtr://0 --uim-get-card-status)
+if echo "$status" | grep -q "Primary GW:.*session doesn't exist"; then
+  aid=$(echo "$status" | awk '/Application type:.*usim/ { f = 1 } f && /Application ID:/ { getline; gsub(/[^0-9A-Fa-f]/, ""); print; exit }')
+  qmicli -d qrtr://0 --uim-change-provisioning-session="session-type=primary-gw-provisioning,activate=yes,slot=1,aid=$aid"
+fi
+```
+
+`qmicli` comes with `libqmi-utils` from native-common; libqmi 1.34 there is built with QRTR support.
+
+#### Mobile data: "Failed to bind MUX"
+
+oFono's `udevng` builds the `qrtrsoc` modem only when `rmnet_ipa0` and at least three `rmnet_dataN` links exist (`mux_id = N + 1`). The modem frames data packets in Qualcomm's multiplexing and aggregation protocol (MAP, also QMAP; version 4 adds a checksum header the hardware fills). On an IPA that offloads those checksums (`/sys/class/net/rmnet_ipa0/device/feature/rx_offload` says `MAPv4`) the links need the matching flags, which iproute2 cannot set and qmicli 1.34 can:
+
+**DEVICE**
+```sh
+ip link set rmnet_ipa0 up
+for n in 0 1 2; do
+  qmicli -d qrtr://0 --link-add="iface=rmnet_ipa0,prefix=rmnet_data,mux-id=$((n + 1)),flags=ingress-map-cksumv4|egress-map-cksumv4"
+done
+```
+
+Then, before the first context, the modem must be told which IPA endpoints form the data port and which framing to use, and the bind request must leave out one field (QMI messages are lists of typed fields, TLVs; this one is the client type). Upstream oFono does none of this, so every context fails with `Failed to bind MUX` and connman's connect returns NotImplemented. The sequence, taken from ModemManager connecting on the same phone: open the data port (DPM OPEN_PORT, service 47; the IPA endpoint ids from `/sys/class/net/rmnet_ipa0/device/modem/{tx,rx}_endpoint_id`, crossed over), set the data format (WDA SET_DATA_FORMAT: raw IP; QMAPv4 up and down when the IPA offloads MAPv4, plain QMAP otherwise; 32 datagrams of 32768 bytes down), bind the connection to the multiplexed link (WDS BIND_MUX_DATA_PORT) without the client type field (TLV 0x13). `patches/ofono/0020-qrtrqmi-ipa-data-path.patch`. Two traps: with plain QMAP on a MAPv4 IPA the context activates and uplink counts, but no downlink arrives; and the modem keeps the first data format it was given until it restarts, so test format changes on a fresh boot.
+
+#### Incoming calls never ring
+
+Two causes, both needed:
+
+- oFono's QMI voice driver waits for call status events (ALL CALL STATUS) but never tells the modem that it wants them (VOICE INDICATION REGISTER), and this modem (with its carrier configuration loaded) sends call status only to clients that asked. Outgoing calls worked; incoming ones reached the modem and never oFono. `patches/ofono/0021-qmimodem-voicecall-register-for-call-notifications.patch` sends that registration (the call notification events field, TLV 0x13) at probe.
+- With its carrier configuration files the modem selects the SIM's carrier profile, here one with voice domain `ps-preferred`: the network routes incoming calls to voice over LTE, which the port has no IP telephony stack (IMS) for, and the caller hears "not available" until an outgoing call has made the phone register for circuit-switched voice. Tell the modem to prefer circuit-switched voice at every modem start (`cs-preferred` in the network access service's selection preference, NAS SET SYSTEM SELECTION PREFERENCE; qmicli has no option for it, a small libqmi script does). Calls then ring awake and from suspend.
+
+#### Don't let the modem hold the user session
+
+`systemd-user-sessions` orders after `network.target`, and oFono is `WantedBy=network.target`. A preparation unit ordered before oFono therefore delays the whole UI until the modem is ready, here up to a minute (the modem restarts once at boot on this firmware). Mask `network.target.wants/ofono.service` in `/etc` and let the preparation unit start oFono when it is done:
+
+```ini
+[Unit]
+After=rmtfs.service tqftpserv.service
+Before=ofono.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/<device>-modem-prep.sh
+```
+
+The script waits for the SIM card service (UIM) to appear in `qrtr-lookup`, activates the provisioning session, creates the links, sets the voice domain, then `systemctl --no-block start ofono.service`, and keeps watching: a modem restart drops the session and the links, and an oFono started on an unprepared modem hangs, with lipstick behind it. Make the preparation idempotent and either `RemainAfterExit=yes` or a watch loop, because a unit pulled in by `ofono.service` reruns on every oFono restart.
+
+#### The Settings SIM page
+
+Settings > Connectivity > SIM cards is `jolla-settings-networking-multisim`, which only Jolla's multi-SIM device patterns pull in. Add it to your adaptation pattern, and set `ModemCount` in `hw-settings.ini` (see [Sensors](#sensors)). The mobile data toggle works through connman as on any device.
+
+Not done: VoLTE and IMS, a second SIM, IPv6, roaming. Call audio is in [Audio](#audio).
+
 ### Wi-Fi and Bluetooth
 
 #### The kernel can't load regulatory.db
@@ -871,7 +1095,7 @@ ACTION=="add", SUBSYSTEM=="ieee80211", RUN+="/usr/sbin/iw phy %k wowlan enable a
 connman keys saved networks by MAC address, so they vanish whenever the address changes. There are two ways to fix it:
 
 - **Device tree:** give the kernel the real address (`local-mac-address`, `local-bd-address`, often filled in by the bootloader). This is the cleaner way.
-- **Userspace:** set the address when the interface appears. That races with connman. victara does this one, with udev-started services that read the factory data (`ip link set ... address` for Wi-Fi, `btmgmt public-addr` for Bluetooth).
+- **Userspace:** set the address when the interface appears. That races with connman. victara does this one, with udev-started services that read the factory data (`ip link set ... address` for Wi-Fi, `btmgmt public-addr` for Bluetooth). A phone without readable factory data for Wi-Fi can derive a locally administered address from `/etc/machine-id` (`02` plus ten hex digits of its sha256), set from a udev-started unit when wlan0 appears, so the late interface holds up neither connman nor the user session; connman is restarted once afterwards.
 
 ### Sensors
 
@@ -895,6 +1119,43 @@ transformation_matrix = "1,0,0,0,1,0,0,0,1"
 
 The stock adaptor couldn't read values from buffered IIO devices, so we use a sensorfw fork (affenull2345's `iio` branch, plus our fixes).
 
+#### No IIO devices at all: the sensors are behind the DSP
+
+On Qualcomm SoCs with a Sensor Core (SM6115 and relatives) the accelerometer, gyroscope, magnetometer, light and proximity sensors are not on a bus the kernel drives. They hang off the audio DSP's sensor subsystem (SSC, the Sensor Core) and are reached over FastRPC (remote procedure calls into the DSP) and QMI (Qualcomm's messaging protocol); the only IIO devices are the PMIC's ADCs. What runs instead, bottom up:
+
+1. **hexagonrpcd** (`github.com/linux-msm/hexagonrpc`) serves the sensor registry and configuration to the ADSP from a directory tree. It needs the fork with write support and the sensor registry interface (pull request 27 plus two patches by nyymi609), the registry data from a working port of the same device (the NixOS port's `hexagonfs` tree here), a writable copy of the registry (the ADSP rewrites it), the platform name the ADSP asks for (`QRD` selects the configs for this board) and the `/dev/fastrpc-adsp` node, which appears late in boot. Kernel side: the fastrpc and SMP2P (the shared-memory signal lines to the DSPs) fixes from the Lenovo TB-J606L port (haltia-de), or the ADSP's sensor process crashes at the first resume from suspend.
+2. **libssc** (Dylan Van Assche, `codeberg.org/DylanVanAssche/libssc`) is the client library; `ssccli --sensor accelerometer` is the first test. It needs libqmi-glib with QRTR, libqrtr-glib and protobuf-c, which Sailfish lacks (the port packages protobuf-c).
+3. **sensorfw adaptors**, one plugin per sensor (`libssc<sensor>adaptor-qt5.so`), built against `sensorfw-qt5-devel`; no sensorfw fork needed. Mapped in `/etc/sensorfw/sensord.conf.d/60-<device>-ssc.conf` under `[plugins]`. Readings arrive already in the phone frame, so start with the identity matrix and verify by tilting; a mount matrix copied from an IIO-based stack inverted the axes here.
+
+Hazards: a client that crashes the ADSP in a loop can freeze the phone when remoteproc recovery is on; with recovery off, a crash takes the ADSP and with it audio down until reboot. Supervise the first run. A client that blocks while the sensor service is missing blocks sensorfwd's main loop and with it lipstick's start (libssc 0.4.4 did; patched in the port).
+
+Tested with Sailfish OS 5.2.0.22 on kernel 7.3: auto-rotation, auto brightness, proximity in calls, compass. The Sensor Core also has a pedometer: an adaptor for it gives Sailfish a step counter (read through QtSensors by an app or a top-menu widget; the AsteroidOS step logger ports to it) that no hybris port has. The adaptors are on their way into sensorfw upstream.
+
+#### Settings shows no sensor items, sensorfwd says "plugin not available"
+
+sensorfwd enables a sensor only when its hardware feature is declared: `20-sensors-default.conf` `[available]` maps each sensor to a `Feature_*` flag that ssu-sysinfo reads from `/usr/share/csd/settings.d/hw-settings.ini`. Without that file only Suspend and Reboot exist. The same list gates Settings items (auto brightness needs `LightSensor=1`) and the status-bar battery indicator (`Battery=1`). A missing declaration looks exactly like a missing driver. This applies to IIO sensors too. An example:
+
+```ini
+[features]
+GSensor=1
+Gyro=1
+ECompass=1
+LightSensor=1
+ProxSensor=1
+Battery=1
+Hall=1
+
+[LED]
+LedType=RGB
+
+[SIM]
+ModemCount=1
+```
+
+#### Apps log "Could not connect to the <type> sensor backend" while sensorfwd works
+
+QtSensors' sensorfw plugin registers its backends only from `/etc/xdg/QtProject/Sensors.conf` (`[Default]`, `QAccelerometer=sensorfw.accelerometer` and so on). droid-hal-configs ships it; a port that assembles its configuration another way has to.
+
 ### Power
 
 #### The CPU keeps jumping to its highest frequency
@@ -903,6 +1164,20 @@ We found two causes:
 
 - **Real-time tasks:** by default every real-time task makes schedutil jump to max, and Sailfish runs some daemons as real-time (dsme). `kernel.sched_util_clamp_min_rt_default = 0` in a `/usr/lib/sysctl.d/` file cut the time at max frequency about 6x.
 - **Kernel bug on 32-bit:** on 7.x kernels, an overflow in the scheduler's load tracking (from `089d84203ad4`) kept idle cores at max frequency. We fixed it by making `r` a `u64` in `update_cfs_rq_load_avg()`.
+
+#### Unplugged, the USB controller stays on
+
+The DWC3 core forbids runtime PM at probe until userspace allows it; Android's init writes `auto`, nothing in Sailfish does. Unplugged, the controller stays active and its PHY supplies stay on, also through system sleep. A udev rule at `bind` (probe resets the file, so `add` is too early):
+
+```
+ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="dwc3", ATTR{power/control}="auto"
+```
+
+Sleep current went from 40-42 mA to 29-32 mA on an SM6115.
+
+#### Nothing wakes the phone once it really sleeps
+
+Once the SoC reaches a deep idle state, only interrupts that are wakeup sources wake it, and several that matter on a phone are not, by default, on mainline: the PMIC Type-C port (a cable plugged into a sleeping phone was seen minutes later), the modem's glink edge (an SMS waited for the next RTC alarm), the touch controller for double-tap to wake. These are kernel changes (`wakeup-source` on the nodes plus small driver patches) in the device kernel series. The lesson for a port: list what must wake your phone, then check each in `/sys/kernel/debug/wakeup_sources` before calling suspend done. A wake about every minute came from connman: without WoWLAN it reconnected after every resume, and its Wi-Fi autoscan hold-off is a wakeup timer (a one-line patch to `sailfish_wifi` makes it a plain timeout; its effect is not measured yet).
 
 ### Encryption
 
@@ -918,11 +1193,80 @@ On armv7, also set `CONFIG_CRYPTO_AES_ARM_BS=y` for NEON AES-XTS.
 
 If the device has large partitions Sailfish doesn't use, like Android's `system` and `cache`, the pack script can add them to the `sailfish` volume group as extra physical volumes (one more sparse image per partition, flashed to that partition). On first boot the initrd gives all free space in the volume group to home. victara gains about 4 GB this way.
 
+### Camera and video
+
+Both cameras of an SM6115 phone work in jolla-camera with Sailfish OS 5.2.0.22 on kernel 7.3: photos, autofocus, tap to focus, flash. 1080p30 H.264 video with AAC sound was proven through jolla-camera's own encodebin pipeline from the real camera, driven headless; recording from the app's UI was not exercised. The stack is the kernel's camera subsystem driver (CAMSS: the camera interface and the pipeline up to memory, without the image processing), libcamera with its software image signal processor (ISP, the demosaicing and colour work) on the GPU, and Sailfish's own Qt 5.6 camerabin plugin with `libcamerasrc` inside it. Nothing from Android.
+
+#### Kernel
+
+The camera sensors, the lens driver and the CAMSS resources for the SoC are in the device kernel series (for SM6115 none of them is upstream yet). CAMSS registers its cameras only when every sensor of its async notifier has bound, so one sensor failing its probe hides every camera: a front sensor that sometimes times out on I2C at boot needs a oneshot that retries the bind. The flash LED joins the rear camera's media device as a V4L2 flash subdevice (`CONFIG_V4L2_FLASH_LED_CLASS=m`, `flash-leds` in the camera node): the camera app runs sandboxed with `/sys` read-only, but it may open `/dev/v4l-subdev*`, so the plugin drives the flash there.
+
+#### libcamera
+
+- Use 0.6 or newer. native-common's 0.4.0 asserts in `PipelineHandler::stop()` when a camera is released. 0.7.2 builds with native-common's packaging.
+- The software ISP runs on the GPU by default when EGL works; the stream size sets the frame rate (about 32 fps at 1280x960 here). Run the viewfinder in a binned sensor mode and switch to the full mode for the still.
+- Out-of-tree sensors need a `CameraSensorHelper`, static properties and a tuning file, or libcamera's image processing algorithms module (IPA, no relation to the modem's IP Accelerator) refuses them.
+- The session user needs the system dma-buf heap, or there are no cameras:
+
+  ```
+  SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"
+  KERNEL=="udmabuf", GROUP="video", MODE="0660"
+  ```
+
+- Autofocus: upstream libcamera had no software-ISP autofocus as of October 2026; backport Milan Zamazal's RFC series plus fixes (a sharpness statistic, tap to focus through `AfWindows`, `AfState` out). Prove the lens by hand with `v4l2-ctl --set-ctrl focus_absolute` before blaming autofocus software.
+- First test without any app: `cam -c 1 --capture=10 --file=/tmp/f#.ppm`.
+
+#### jolla-camera
+
+- Sailfish's camerabin takes its source from the session environment. Put it in `/var/lib/environment/nemo/70-<device>-camera.conf`, because apps start from boosters and never see shell exports:
+
+  ```sh
+  QT_GSTREAMER_CAMERABIN_VIDEOSRC=libcamerasrc
+  GST_PLUGIN_FEATURE_RANK=avenc_aac:primary
+  ```
+
+  `VIDEOSRC`, not `SRC`: the latter replaces camerabin's whole source, is meant for droidcamsrc, and fails to link.
+- Remove `nemo-qtmultimedia-plugins-gstvideotexturebackend` from the pattern. It is the hybris QML video node and makes QtMultimedia ask for `droideglsink`; without it Qt's own renderer backs `VideoOutput`.
+- **Black viewfinder, "Resource not found" for a file that exists**: sailjail hides `/usr/share/libcamera`, so inside the sandbox the software ISP finds no IPA or tuning file and offers only raw Bayer. `whitelist /usr/share/libcamera` in `/etc/firejail/disable-common.local`.
+- Sailfish's qtmultimedia (mer-5.6, the `+v4l` build from native-common) needs patches to work with libcamerasrc: it crashed on a source without size caps, listed every CAMSS video node as a camera, requested no size, failed the pipeline on one late frame, never read the initial ready-for-capture, ignored the camera orientation. That is 14 patches (device enumeration through libcamera, sizes from the device provider, orientation and front-camera mirroring, flash, tap to focus, ISO, a small viewfinder with a full-size still).
+- Resolutions come from dconf (`/etc/dconf/db/vendor.d/jolla-camera-hw.txt`): `imageResolution`, `viewfinderResolution*` and `videoResolution` per camera, and `/apps/jolla-camera/maxVideoResolution='1920x1080'` to cap video at what the encoder does.
+- Boosters keep the old libraries mapped: after replacing libcamera or qtmultimedia, restart `booster-silica-media@jolla-camera.service` and `booster-silica-media@jolla-camera-lockscreen.service` as the session user.
+
+#### Video recording and hardware codecs
+
+Jolla's `gst-plugins-good` is built with `-Dv4l2-probe=false`, which compiles out the registration of the stateful V4L2 codec elements (`v4l2h264enc`, `v4l2h264dec`, ...). Hybris devices encode through droidmedia and never needed them; a mainline port with a V4L2 codec (Qualcomm Venus) has no hardware encoder without them. Rebuild the package with the option on (one spec change, `patches/gst-plugins-good/`; the cost is that every `/dev/video*` is opened once when the registry is built). The audio track needs an AAC encoder: `avenc_aac` from gst-libav is registered with rank none and never chosen by encodebin, hence the `GST_PLUGIN_FEATURE_RANK` line above.
+
+Venus wants a firmware the driver accepts: on SM6115 and QCM2290 the driver refuses anything below 6.0.55, and a vendor image can be older (6.0.49 seen). linux-firmware's `qcom/venus-6.0/venus.mbn` loaded on a retail unit, so the board node needs no `firmware-name` for Venus. Decoding through `v4l2h264dec` is registered by the same build; playback through it was not tested.
+
+A fallback camera app that talks to libcamera directly is piggz's `harbour-shutter`; as of October 2026 its OBS build does not resolve on Sailfish 5.x.
+
+### Boot on an A/B Android bootloader
+
+A phone with Qualcomm's Android bootloader (ABL) boots a plain Android boot image (header v0, kernel with the DTB appended) straight from ABL, as chapter 6 produces one; no second bootloader. Two things victara's bootloader does not have:
+
+- **The slot has to be marked successful after every boot.** ABL counts boot attempts per slot and stops booting a slot that is never marked. Run `qbootctl -m` (`github.com/linux-msm/qbootctl`; it needs the 7.x `scsi_bsg_ufs.h` vendored, because the SDK's kernel headers predate it) from a oneshot in `multi-user.target`.
+- **Partitions carry the slot suffix** (`boot_a`, `modem_a`). Read `androidboot.slot_suffix` from `/proc/cmdline` where a script needs them, as the firmware mount in [Firmware](#firmware) does.
+
+This ABL refuses `fastboot boot`, so every kernel test is a flash of `boot_a`; keep the previous image. From a running system `systemctl reboot bootloader` lands in fastboot. The first logo after power-on is drawn by the signed firmware and cannot be changed; the port draws its own splash from the initramfs onto `/dev/fb0` as its first step, with the kernel console kept off the screen.
+
+### Fingerprint
+
+#### The sensor hangs off a TrustZone-owned bus
+
+On Qualcomm phones the fingerprint sensor's SPI controller is usually disabled in every stock device tree and its pins are reserved in the mainline device tree: TrustZone (the secure world the SoC runs beside Linux) owns the bus, and the sensor is read by a trusted application (TA, a program running in that secure world) that the vendor's Android HAL talks to over QSEECOM, Qualcomm's interface for sending commands to such applications. No Linux SPI driver can take it over. What works instead, bottom up:
+
+1. **Kernel:** Bartosz Wróbel's out-of-tree QSEECOM driver for the kernel's trusted execution environment (TEE) subsystem (`drivers/tee/qseecom`, `github.com/wrobelda/goodix-fp-spi-linux`, `CONFIG_TEE_QSEECOM=m`), which loads TAs and sends them commands through the Linux TEE ioctls. Two fixes are needed on top as of 7.3 (both in the SM6115 port's kernel series, neither upstream yet): the driver's listener loop must bound *failed* requests, not served ones (a TA reads its template store through the file listener in 20 KB pieces, hundreds of served requests for one command), and mainline's `qcom_tzmem_shm_bridge_create()` passes a positive firmware status up through `ERR_PTR()`, which `IS_ERR()` does not catch; the first `qcom_tzmem_alloc()` on that "pool" oopses. Without both, a device with a few enrolled fingers hangs hard on the daemon's first command.
+2. **Supplicant:** `qsee-supplicant` (same author) answers the TA's file-system listener requests, so templates land under `/var/lib/qsee-supplicant` (root only, back it up before kernel experiments), and `qsee-app-loader@<ta>` keeps the TA loaded. The stock TA firmware comes from the vendor image and is not redistributable.
+3. **Daemon:** implement `org.sailfishos.fingerprint1`, the D-Bus API of Jolla's `sailfish-fpd`, yourself (model: `sailfishos-open/sailfish-fpd-community`'s D-Bus side; its hardware side is the Android HAL through libhybris and does not apply), with `Provides: sailfish-fpd` so Jolla's package, which needs a closed hybris slave, is never pulled. The hardware side replays the vendor HAL's command sequence to the TA: read it off the HAL library's disassembly, from the first command on (a TA that gets any command before its init kills its instance; some TAs answer in place over the request and need the request passed INOUT). Power the sensor's enable GPIO yourself; polling the TA's touch detection every 30 ms is enough for enrolment and lock screen unlock.
+4. **Device lock:** install Jolla's `sailfish-devicelock-fpd` and `sailfish-devicelock-libs` from the release repository (`zypper in --force-resolution`: it replaces `jolla-devicelock-daemon-encsfa` and `-plugin-encsfa`). That is what makes Settings > Device lock show the Fingerprint section. Then restart the Settings app and lipstick, or reboot: device lock clients keep their socket to the old daemon, and until they reconnect the section stays hidden and the lock screen never asks for a finger. The first boot asks for the lock code before the sensor is used.
+
+Tested with Sailfish OS 5.2.0.22 on kernel 7.3 (SM6115, MicroArray sensor, TA `mafp`): two fingers enrolled from Settings, both unlock the phone on the lock screen after a sleep. Open: the match rate on the first try, the sensor interrupt (the daemon polls), and automatic recovery when the TA instance dies.
+
 ### Not solved yet
 
-- **Calls, SMS and mobile data on Qualcomm modems:** the modem talks QMI (it needs `rmtfs` and `qrtr`), and Sailfish's ofono is built without its QMI driver.
-- **Camera.**
-- **Hardware video decoding.**
+- **Calls, SMS and mobile data on Qualcomm modems** on victara: the modem talks QMI (it needs `rmtfs` and `qrtr`), and Jolla's ofono is built without its QMI driver. On a QRTR modem they work with the Sailfish-patched upstream oFono, see [Modem](#modem-qualcomm-qrtr); the three oFono patches are not upstream anywhere yet.
+- **Camera** on victara. See [Camera and video](#camera-and-video) for a libcamera port.
+- **Hardware video decoding.** Encoding works through Venus (same section); decoding is untested.
 
 
 ## 14. Hardware Adaptation Checklist
@@ -943,4 +1287,15 @@ If the device has large partitions Sailfish doesn't use, like Android's `system`
 | Battery life | [Power](#power) |
 | Home encryption | [Encryption](#encryption), [kernel config](#kernel-config) |
 | Screenshots, browser | [Display and graphics](#display-and-graphics) |
-| Calls, SMS, data | [Not solved yet](#not-solved-yet) |
+| Calls, SMS, data | [Modem](#modem-qualcomm-qrtr) for QRTR modems; otherwise [Not solved yet](#not-solved-yet) |
+| Call audio | [Call audio on q6](#call-audio-on-qualcomm-dsp-audio-q6) |
+| Camera, video recording | [Camera and video](#camera-and-video) |
+| Sensors behind a DSP | [No IIO devices at all](#no-iio-devices-at-all-the-sensors-are-behind-the-dsp) |
+| Settings pages, feature flags | [Patterns](#patterns), [Settings shows no sensor items](#settings-shows-no-sensor-items-sensorfwd-says-plugin-not-available) |
+| Modem firmware at runtime, A/B slot | [Firmware](#firmware), [Boot on an A/B bootloader](#boot-on-an-ab-android-bootloader) |
+| Fingerprint | [Fingerprint](#fingerprint) |
+
+
+## 15. Credits
+
+The SM6115 entries rest on other people's work: nyymi609 (the NixOS port of that phone: kernel patches, firmware set, UCM profile, haptics driver, the voice-call helper), piggz (the PinePhone port, the native branch of droid-hal-configs, the PulseAudio and oFono builds, Shutter), haltia-de (the Lenovo TB-J606L port: the fastrpc, SMP2P and qrtr fixes), Dylan Van Assche (libssc), Milan Zamazal (software-ISP autofocus for libcamera), Stephan Gerhold (q6voice), kabouik (the hybris mce configuration, the first mapping of the fingerprint application's commands), TheKit and NotKit (xkeyboard-config for its keyboard), Bartosz Wróbel (the QSEECOM TEE driver and qsee-supplicant), the sailfish-fpd-community contributors (the fingerprint daemon's D-Bus side), the sailfishos-native and sailfish-on-dontbeevil contributors, and moWerk, who owns that port (`github.com/moWerk/sailfishos-pro1x-mainline`) and ran every test on the device. It was built with LLM assistance and says so in its repository.
