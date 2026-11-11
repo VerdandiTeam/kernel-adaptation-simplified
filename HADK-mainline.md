@@ -631,6 +631,14 @@ On hybris ports, Android's init creates the USB gadget, and usb-moded only switc
    interface = usb0
    ```
 
+3. **FunctionFS for MTP** **(Pro1-X)**. The `ffs.mtp` function only works when FunctionFS is mounted where buteo-mtp expects it, before usb-moded starts. The Pro1-X does it in the same oneshot:
+
+   **DEVICE**
+   ```sh
+   mkdir -p /dev/mtp
+   mount -t functionfs -o uid=0,gid=$(getent group mtp | cut -d: -f3),rmode=0770,fmode=0660 mtp /dev/mtp
+   ```
+
 Also set up cable detection ([usb-moded doesn't notice the cable](#usb-moded-doesnt-notice-the-cable-or-always-picks-charging-only)). Then turn on developer mode in Settings, and the device is at `192.168.2.15` over USB:
 
 **HOST**
@@ -667,6 +675,8 @@ extcon_tracking = 1
 ```
 
 Find the right one with `cat /sys/class/extcon/*/name` and `state`, with the cable in and out. The extconN numbers aren't guaranteed to stay the same, so we also disabled the unused extcon device in the device tree.
+
+The other way **(Pro1-X)**: a charger driver that registers a power supply named `usb` with `online` and `type` (`USB`, `USB_DCP`, `USB_CDP`). usb-moded's default tracking reads it, with no `[udev]` section at all. A Type-C port manager supply (tcpm) does not report a PC host as `online`, so point usb-moded at the charger's supply, not the Type-C one.
 
 ### Charging and battery
 
