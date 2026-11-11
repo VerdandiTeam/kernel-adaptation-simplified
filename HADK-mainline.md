@@ -883,6 +883,50 @@ WantedBy=sysinit.target
 - The kernel tries `firmware_class.path` first and `/lib/firmware` after it, so packaged and partition firmware work side by side.
 - It's the same idea as postmarketOS's msm-firmware-loader.
 
+#### The modem and the DSPs fetch files at runtime (Qualcomm) (Pro1-X)
+
+`/lib/firmware` is only the first half. Once the modem runs, it asks the host for more over two channels, and Sailfish OS provides neither:
+
+- **rmtfs** serves the modem's EFS (the `modemst1`, `modemst2`, `fsg` and `fsc` partitions) over shared memory. Never let anything write those partitions: they hold the IMEI and the per-unit calibration. Run rmtfs read-only on the partitions (`-r -P`; then everything the modem learns is lost at every boot and every GNSS start is a cold start), or on files seeded once from the partitions (`-o /var/lib/rmtfs`, a root-only directory; the Pro1-X way). With `-s` rmtfs also starts the modem remoteproc itself once it serves.
+- **tqftpserv** answers the modem's TFTP requests over QRTR. It maps `/readonly/firmware/image/...` to the remoteproc's `firmware-name` directory under `/lib/firmware`. At every start the modem asks for its carrier configuration there, `modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig` and `mcfg_sw/mbn_sw.dig`. Missing, tqftpserv logs `unable to open ..., reject` and the modem runs on defaults: calls and data still work, GNSS tracks no satellite at all.
+
+Both come from `github.com/linux-msm` (`rmtfs`, `tqftpserv`, and `qrtr` for `qrtr-lookup`); the Pro1-X port packages them as RPMs. Only these two daemons are still needed: the QRTR name service and the protection-domain mapper are in the kernel (`CONFIG_QRTR`, `CONFIG_QCOM_PD_MAPPER`). Guides that list four daemons are from 2021. If your firmware lives on the mounted partition rather than under `/lib/firmware`, check where your tqftpserv build looks; the Pro1-X keeps the modem firmware under `/lib/firmware`.
+
+The MCFG files are on the `modem` partition, which Android mounts at `/vendor/firmware_mnt`. Mount it read-only and bind its `image/modem_pr` next to `modem.mbn` before tqftpserv starts, and wait for the partition link, because early in boot udev may not have created it yet:
+
+**DEVICE**
+```sh
+fw=/lib/firmware/qcom/<soc>/<vendor>/<device>   # where firmware-name points
+mnt=/run/<device>/modem
+slot=$(sed -n 's/.*androidboot.slot_suffix=\(_[ab]\).*/\1/p' /proc/cmdline)
+dev=/dev/disk/by-partlabel/modem${slot:-_a}
+mkdir -p $mnt $fw/modem_pr
+for i in $(seq 1 30); do [ -e $dev ] && break; sleep 1; done
+mountpoint -q $mnt || mount -t vfat -o ro,nodev,nosuid,noexec $dev $mnt
+mountpoint -q $fw/modem_pr || mount --bind $mnt/image/modem_pr $fw/modem_pr
+```
+
+The rmtfs unit from the sources has `ConditionPathExists=/dev/qcom_rmtfs_mem1`, which is not there yet when the unit is scheduled, so the service is silently skipped. Clear the condition and wait for the node instead:
+
+```ini
+[Unit]
+ConditionPathExists=
+StartLimitIntervalSec=0
+
+[Service]
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 180); do [ -e /dev/qcom_rmtfs_mem1 ] && exit 0; sleep 1; done; exit 1'
+ExecStart=
+ExecStart=/usr/bin/rmtfs -o /var/lib/rmtfs -s
+TimeoutStartSec=240
+```
+
+Two things follow from this chain:
+
+- **Wi-Fi depends on it.** On WCN3990-class chips (ath10k_snoc) Wi-Fi only comes up after the modem remoteproc, rmtfs and tqftpserv run. Debug a missing wlan0 from the modem side first.
+- **`/sys/class/remoteproc/*/recovery` is a safety switch.** With recovery enabled, a client that crashes a DSP in a loop can freeze the phone; disabled, a crash leaves that DSP and everything on it (audio on the ADSP) down until reboot. Choose per experiment and check the default first.
+
+Tested on the Pro1-X: Sailfish OS 5.2.0.22, kernel 7.3, modem firmware MPSS.HA.1.1. Before the MCFG mount the modem heard no satellite; after it, satellites were tracked at the same spot and the modem kept its EFS across boots.
+
 ### Wi-Fi and Bluetooth
 
 #### The kernel can't load regulatory.db
