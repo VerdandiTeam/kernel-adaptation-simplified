@@ -712,6 +712,8 @@ DisableValue=0
 
 victara's charger driver had no such switch, so we gave it a `charging_enabled` module parameter.
 
+mce looks for the control file once, at start **(Pro1-X)**. If the driver that provides it loads later, the charge limit silently disappears from Settings. Order mce after it, for example an `ExecStartPre` drop-in on `mce.service` that waits for the path (the Pro1-X waits up to 30 s). Two more things from the Pro1-X: register a power supply named `usb` with `online` and `type` even when the charger driver only manages the input current, because usb-moded and mce read it, and let the battery supply follow it (`supplied_to`), so a plug change is reported at once instead of at the next poll; and report `Not charging` when input is present but the limit stopped the current, so the UI does not say charging while nothing flows.
+
 ### Notification LED
 
 #### The LED never lights up
@@ -726,11 +728,17 @@ LedDirectory=/sys/class/leds/<led name>
 
 victara's LED is a single green one, so we use `white`. Don't give the LED a `linux,default-trigger` in the device tree, because mce wants to drive it itself.
 
+#### The LED is one multicolor device (Pro1-X)
+
+Mainline device trees describe an RGB indicator as one LED class device of the multicolor framework (`rgb:status` with `multi_intensity` and `multi_index`), while every backend of mce-plugin-libhybris expects one device per colour (`vanilla` takes `RedDirectory`, `GreenDirectory`, `BlueDirectory`). Either split the device tree into three LEDs, or add a backend: the Pro1-X carries `patches/mce-plugin-libhybris/0001-sysfs-led-add-multicolor-backend.patch` (`BackEnd=multicolor`, `LedDirectory=/sys/class/leds/rgb:status`), which writes the colour to `multi_intensity`, switches with `brightness`, and blinks with its own timer, because the PMIC LPG's hardware blink gives every channel the same duty cycle out of phase and a green blink shows a red, green, blue sweep. Not upstream.
+
 ### Vibration
 
 #### ngfd logs "Vibra upload effect: No space left on device"
 
 ngfd's ff-memless config uploads more effects (17) than the kernel's ff-memless has slots (16). We raised `FF_MEMLESS_EFFECTS` to 64 in `drivers/input/ff-memless.c`.
+
+The Pro1-X keeps the stock kernel and trims the list instead **(Pro1-X)**: a file whose name ends in `ffmemless.ini` and sorts after `50-` (`/usr/share/ngfd/plugins.d/60-<device>-ffmemless.ini`) with `[ffmemless] supported_effects` listing 12 names or fewer (one of the stock 17 is a typo, `drag_boundary_drag_end`). Files with other names are not merged as plugin parameters, and `NGF_FFMEMLESS_SETTINGS` overrides only parameters, not the list. It also uses `libngf-qt5-qtfeedback` as the Qt feedback plugin instead of `qt5-feedback-haptics-ffmemless`, which bypasses ngfd and uploads 2-3 effects per process into the same 16 slots, and disables theme effects when an upload returns id 0 (which happens when ngfd died first). The trade-off: victara's kernel bump keeps the stock effect list and the Qt plugin's per-process effects; the Pro1-X route keeps a stock kernel. Motor strength is a driver parameter either way: an accepted `FF_RUMBLE` can still be too weak to feel. The Pro1-X ships `options aw86224 d2s_gain=7 drv2_lvl=100` in `/etc/modprobe.d/`.
 
 #### Touch feedback is too weak to feel
 
