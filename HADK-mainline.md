@@ -927,6 +927,104 @@ Two things follow from this chain:
 
 Tested on the Pro1-X: Sailfish OS 5.2.0.22, kernel 7.3, modem firmware MPSS.HA.1.1. Before the MCFG mount the modem heard no satellite; after it, satellites were tracked at the same spot and the modem kept its EFS across boots.
 
+### Modem (Qualcomm, QRTR) (Pro1-X)
+
+Calls, SMS and mobile data work on the Pro1-X (SM6115, modem firmware MPSS.HA.1.1) with Sailfish OS 5.2.0.22 on kernel 7.3: data with ping and HTTPS, calls both ways including from suspend, SMS both ways. The modem has no USB side; it talks QMI over QRTR, and the data path runs through the IPA. Each piece below is in `github.com/moWerk/sailfishos-pro1x-mainline` (`patches/ofono/`, `droid-config-qx1050/sparse/`).
+
+#### Kernel and firmware
+
+`CONFIG_QRTR=y`, `CONFIG_QRTR_SMD=y`, `CONFIG_QCOM_PD_MAPPER=y`, `CONFIG_QCOM_Q6V5_PAS=m` for the remoteproc, `CONFIG_QCOM_IPA=m` and an IPA node in the device tree: `rmnet_ipa0` only exists with it, and oFono builds its modem from that netdev. Then the rmtfs and tqftpserv chain from [Firmware](#the-modem-and-the-dsps-fetch-files-at-runtime-qualcomm-pro1-x). `qrtr-lookup` lists the modem's services once it is up; `qmicli -d qrtr://0 --dms-get-ids` talks to it without any modem manager.
+
+#### Sailfish's oFono has no QRTR, the Sailfish-patched upstream one has
+
+Jolla's oFono 1.29 has `qmimodem` disabled and its `gobi` plugin speaks USB QMUX only. Upstream oFono 2.9 and later has `plugins/qrtrqmi.c`, and `github.com/sailfishos-native/ofono` is upstream 2.12 plus Jolla's Sailfish patches (the slot manager, the D-Bus interfaces lipstick and Settings talk to). The PinePhone port builds it as `ofono-2.12.0+git1` with `ell-0.70` in `nemo:devel:hw:pine:dontbeevil`, and that build runs on the Pro1-X with the three patches below on top.
+
+oFono 2.x takes a deny-list, never the 1.x `--plugin` allow-list; `qrtrqmi`, `qmimodem`, the slot manager and provisioning are built in. `/var/lib/environment/ofono/<device>.conf`:
+
+```sh
+OFONO_ARGS=--noplugin=aml,phonesim
+```
+
+`aml` is Jolla's 1.29-era plugin left behind by sailfish-aml and fails to load against 2.x; `phonesim` wants a config file that does not exist.
+
+oFono's provisioning service runs as the Android-era `radio` user. Create it in your kickstart `%post`:
+
+```sh
+getent group radio >/dev/null || groupadd -g 1001 radio
+getent passwd radio >/dev/null || useradd radio --uid 1001 -g radio -r -s /sbin/nologin
+```
+
+#### oFono sees the SIM, Settings doesn't
+
+`org.ofono.Manager.GetModems` lists the modem online, `SimManager` says present, the network is registered, and still Settings shows no SIM, connman has no cellular technology and the status bar no signal. Settings, connman, the status bar and commhistoryd read `org.nemomobile.ofono.ModemManager`, the Sailfish slot manager, which lists only modems a plugin registers as slots (`ofono_slot_driver_register`). Jolla's patch set adds that to `gobi` only.
+
+The Pro1-X port adds a slot driver to `plugins/qrtrqmi.c`, modelled on sailfishos-native's patch `0010-Add-slot-support-to-the-gobi-plugin`: register the driver in probe, add one slot when DMS GET_IDS answers (the IMEI, or a placeholder), follow the SIM atom through `ofono_watch` so an absent SIM ends up ABSENT instead of leaving the manager unready forever. About 135 lines, `patches/ofono/0019-qrtrqmi-add-slot-driver.patch`, applies on 2.12 and 2.13. Check with:
+
+**DEVICE**
+```sh
+dbus-send --system --print-reply --dest=org.ofono / org.nemomobile.ofono.ModemManager.GetAll
+```
+
+`AvailableModems` and `EnabledModems` must list your modem.
+
+#### The SIM stays "detected", nothing registers
+
+Some modem firmwares do not keep the UIM primary GW provisioning session. The card shows present, PIN state `not-initialized`, no registration ever. Activate the session before oFono, every boot, idempotently (postmarketOS's `msm-modem-uim-selection` does the same):
+
+**DEVICE**
+```sh
+status=$(qmicli -d qrtr://0 --uim-get-card-status)
+if echo "$status" | grep -q "Primary GW:.*session doesn't exist"; then
+  aid=$(echo "$status" | awk '/Application type:.*usim/ { f = 1 } f && /Application ID:/ { getline; gsub(/[^0-9A-Fa-f]/, ""); print; exit }')
+  qmicli -d qrtr://0 --uim-change-provisioning-session="session-type=primary-gw-provisioning,activate=yes,slot=1,aid=$aid"
+fi
+```
+
+`qmicli` comes with `libqmi-utils` from native-common; libqmi 1.34 there is built with QRTR support.
+
+#### Mobile data: "Failed to bind MUX"
+
+oFono's `udevng` builds the `qrtrsoc` modem only when `rmnet_ipa0` and at least three `rmnet_dataN` links exist (`mux_id = N + 1`). On an IPA that offloads MAPv4 checksums (`/sys/class/net/rmnet_ipa0/device/feature/rx_offload` says `MAPv4`) the links need the matching flags, which iproute2 cannot set and qmicli 1.34 can:
+
+**DEVICE**
+```sh
+ip link set rmnet_ipa0 up
+for n in 0 1 2; do
+  qmicli -d qrtr://0 --link-add="iface=rmnet_ipa0,prefix=rmnet_data,mux-id=$((n + 1)),flags=ingress-map-cksumv4|egress-map-cksumv4"
+done
+```
+
+Then, before the first context, the modem must be told which IPA endpoints form the data port and which framing to use, and the bind must not carry the client-type TLV. Upstream oFono does none of this, so every context fails with `Failed to bind MUX` and connman's connect returns NotImplemented. The sequence, taken from ModemManager connecting on the same phone: DPM OPEN_PORT (service 47; the IPA endpoint ids from `/sys/class/net/rmnet_ipa0/device/modem/{tx,rx}_endpoint_id`, crossed over), WDA SET_DATA_FORMAT (raw-ip; QMAPv4 up and down when the IPA offloads MAPv4, plain QMAP otherwise; 32 datagrams of 32768 bytes down), WDS BIND_MUX_DATA_PORT without TLV 0x13. `patches/ofono/0020-qrtrqmi-ipa-data-path.patch`. Two traps: with plain QMAP on a MAPv4 IPA the context activates and uplink counts, but no downlink arrives; and the modem keeps the first data format it was given until it restarts, so test format changes on a fresh boot.
+
+#### Incoming calls never ring
+
+Two causes on the Pro1-X, both needed:
+
+- oFono's QMI voice driver registers a handler for ALL CALL STATUS but never sends VOICE INDICATION REGISTER, and this modem (with its carrier configuration loaded) sends call status only to clients that registered. Outgoing calls worked; incoming ones reached the modem and never oFono. `patches/ofono/0021-qmimodem-voicecall-register-for-call-notifications.patch` sends the registration (TLV 0x13, call notification events) at probe.
+- With its MCFG files the modem selects the SIM's carrier profile, here one with voice domain `ps-preferred`: the network routes incoming calls to VoLTE, which the port has no IMS stack for, and the caller hears "not available" until an outgoing call has made the phone register for circuit-switched voice. Set the voice domain to `cs-preferred` at every modem start (NAS SET SYSTEM SELECTION PREFERENCE; qmicli has no option for it, the port carries a small libqmi script, `qx1050-voice-domain.py`). Calls then ring awake and from suspend.
+
+#### Don't let the modem hold the user session
+
+`systemd-user-sessions` orders after `network.target`, and oFono is `WantedBy=network.target`. A preparation unit ordered before oFono therefore delays the whole UI until the modem is ready, here up to a minute (the modem restarts once at boot on this firmware). Mask `network.target.wants/ofono.service` in `/etc` and let the preparation unit start oFono when it is done:
+
+```ini
+[Unit]
+After=rmtfs.service tqftpserv.service
+Before=ofono.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/<device>-modem-prep.sh
+```
+
+The script waits for the UIM service in `qrtr-lookup`, activates the provisioning session, creates the links, sets the voice domain, then `systemctl --no-block start ofono.service`, and keeps watching: a modem restart drops the session and the links, and an oFono started on an unprepared modem hangs, with lipstick behind it. Make the preparation idempotent and either `RemainAfterExit=yes` or a watch loop, because a unit pulled in by `ofono.service` reruns on every oFono restart.
+
+#### The Settings SIM page
+
+Settings > Connectivity > SIM cards is `jolla-settings-networking-multisim`, which only Jolla's multi-SIM device patterns pull in. Add it to your adaptation pattern, and set `ModemCount` in `hw-settings.ini` (see [Sensors](#sensors)). The mobile data toggle works through connman as on any device.
+
+Not done on the Pro1-X: VoLTE and IMS, a second SIM, IPv6, roaming. Call audio is in [Audio](#audio).
+
 ### Wi-Fi and Bluetooth
 
 #### The kernel can't load regulatory.db
@@ -995,7 +1093,7 @@ If the device has large partitions Sailfish doesn't use, like Android's `system`
 
 ### Not solved yet
 
-- **Calls, SMS and mobile data on Qualcomm modems:** the modem talks QMI (it needs `rmtfs` and `qrtr`), and Sailfish's ofono is built without its QMI driver.
+- **Calls, SMS and mobile data on Qualcomm modems** on victara: the modem talks QMI (it needs `rmtfs` and `qrtr`), and Jolla's ofono is built without its QMI driver. The Pro1-X has them working with the Sailfish-patched upstream oFono, see [Modem](#modem-qualcomm-qrtr-pro1-x); its three oFono patches are not upstream anywhere yet.
 - **Camera.**
 - **Hardware video decoding.**
 
