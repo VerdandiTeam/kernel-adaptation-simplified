@@ -1280,3 +1280,8 @@ This ABL refuses `fastboot boot`, so every kernel test is a flash of `boot_a`; k
 | Sensors behind a DSP | [No IIO devices at all](#no-iio-devices-at-all-the-sensors-are-behind-the-dsp-pro1-x) |
 | Settings pages, feature flags | [Patterns](#patterns), [Settings shows no sensor items](#settings-shows-no-sensor-items-sensorfwd-says-plugin-not-available) |
 | Modem firmware at runtime, A/B slot | [Firmware](#firmware), [Boot on an A/B bootloader](#boot-on-an-ab-android-bootloader-pro1-x) |
+
+
+## 15. Credits
+
+The Pro1-X entries rest on other people's work: nyymi609 (the NixOS port of the Pro1-X: kernel patches, firmware set, UCM profile, haptics driver, the voice-call helper), piggz (the PinePhone port, the native branch of droid-hal-configs, the PulseAudio and oFono builds, Shutter), haltia-de (the Lenovo TB-J606L port: the fastrpc, SMP2P and qrtr fixes), Dylan Van Assche (libssc), Milan Zamazal (software-ISP autofocus for libcamera), Stephan Gerhold (q6voice), Kabouik (the hybris Pro1-X mce configuration), TheKit and NotKit (xkeyboard-config for the Pro1), the sailfishos-native and sailfish-on-dontbeevil contributors, and moWerk, who owns the Pro1-X port and ran every test on the device. The Pro1-X port was built with LLM assistance and says so in its repository.
