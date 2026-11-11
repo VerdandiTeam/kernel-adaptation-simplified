@@ -1167,11 +1167,58 @@ On armv7, also set `CONFIG_CRYPTO_AES_ARM_BS=y` for NEON AES-XTS.
 
 If the device has large partitions Sailfish doesn't use, like Android's `system` and `cache`, the pack script can add them to the `sailfish` volume group as extra physical volumes (one more sparse image per partition, flashed to that partition). On first boot the initrd gives all free space in the volume group to home. victara gains about 4 GB this way.
 
+### Camera and video (Pro1-X)
+
+Both cameras of the Pro1-X work in jolla-camera with Sailfish OS 5.2.0.22 on kernel 7.3: photos, autofocus, tap to focus, flash. 1080p30 H.264 video with AAC sound was proven through jolla-camera's own encodebin pipeline from the real camera, driven headless; recording from the app's UI was not exercised. The stack is CAMSS in the kernel, libcamera with its software ISP on the GPU, and Sailfish's own Qt 5.6 camerabin plugin with `libcamerasrc` inside it. Nothing from Android.
+
+#### Kernel
+
+The camera sensors, the lens driver and the CAMSS resources for the SoC are in the device kernel series (for SM6115 none of them is upstream yet). CAMSS registers its cameras only when every sensor of its async notifier has bound, so one sensor failing its probe hides every camera: on the Pro1-X the front sensor sometimes times out on I2C at boot, and a oneshot retries the bind. The flash LED joins the rear camera's media device as a V4L2 flash subdevice (`CONFIG_V4L2_FLASH_LED_CLASS=m`, `flash-leds` in the camera node): the camera app runs sandboxed with `/sys` read-only, but it may open `/dev/v4l-subdev*`, so the plugin drives the flash there.
+
+#### libcamera
+
+- Use 0.6 or newer. native-common's 0.4.0 asserts in `PipelineHandler::stop()` when a camera is released. The Pro1-X builds 0.7.2 with native-common's packaging.
+- The software ISP runs on the GPU by default when EGL works; the stream size sets the frame rate (about 32 fps at 1280x960 here). Run the viewfinder in a binned sensor mode and switch to the full mode for the still.
+- Out-of-tree sensors need a `CameraSensorHelper`, static properties and a tuning file, or the IPA refuses them.
+- The session user needs the system dma-buf heap, or there are no cameras:
+
+  ```
+  SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="video", MODE="0660"
+  KERNEL=="udmabuf", GROUP="video", MODE="0660"
+  ```
+
+- Autofocus: upstream libcamera had no software-ISP autofocus as of October 2026; the Pro1-X backports Milan Zamazal's RFC series plus fixes (a sharpness statistic, tap to focus through `AfWindows`, `AfState` out). Prove the lens by hand with `v4l2-ctl --set-ctrl focus_absolute` before blaming autofocus software.
+- First test without any app: `cam -c 1 --capture=10 --file=/tmp/f#.ppm`.
+
+#### jolla-camera
+
+- Sailfish's camerabin takes its source from the session environment. Put it in `/var/lib/environment/nemo/70-<device>-camera.conf`, because apps start from boosters and never see shell exports:
+
+  ```sh
+  QT_GSTREAMER_CAMERABIN_VIDEOSRC=libcamerasrc
+  GST_PLUGIN_FEATURE_RANK=avenc_aac:primary
+  ```
+
+  `VIDEOSRC`, not `SRC`: the latter replaces camerabin's whole source, is meant for droidcamsrc, and fails to link.
+- Remove `nemo-qtmultimedia-plugins-gstvideotexturebackend` from the pattern. It is the hybris QML video node and makes QtMultimedia ask for `droideglsink`; without it Qt's own renderer backs `VideoOutput`.
+- **Black viewfinder, "Resource not found" for a file that exists**: sailjail hides `/usr/share/libcamera`, so inside the sandbox the software ISP finds no IPA or tuning file and offers only raw Bayer. `whitelist /usr/share/libcamera` in `/etc/firejail/disable-common.local`.
+- Sailfish's qtmultimedia (mer-5.6, the `+v4l` build from native-common) needs patches to work with libcamerasrc: it crashed on a source without size caps, listed every CAMSS video node as a camera, requested no size, failed the pipeline on one late frame, never read the initial ready-for-capture, ignored the camera orientation. The Pro1-X carries 14 patches in `patches/qtmultimedia/` (device enumeration through libcamera, sizes from the device provider, orientation and front-camera mirroring, flash, tap to focus, ISO, a small viewfinder with a full-size still).
+- Resolutions come from dconf (`/etc/dconf/db/vendor.d/jolla-camera-hw.txt`): `imageResolution`, `viewfinderResolution*` and `videoResolution` per camera, and `/apps/jolla-camera/maxVideoResolution='1920x1080'` to cap video at what the encoder does.
+- Boosters keep the old libraries mapped: after replacing libcamera or qtmultimedia, restart `booster-silica-media@jolla-camera.service` and `booster-silica-media@jolla-camera-lockscreen.service` as the session user.
+
+#### Video recording and hardware codecs
+
+Jolla's `gst-plugins-good` is built with `-Dv4l2-probe=false`, which compiles out the registration of the stateful V4L2 codec elements (`v4l2h264enc`, `v4l2h264dec`, ...). Hybris devices encode through droidmedia and never needed them; a mainline port with a V4L2 codec (Qualcomm Venus) has no hardware encoder without them. Rebuild the package with the option on (one spec change, `patches/gst-plugins-good/`; the cost is that every `/dev/video*` is opened once when the registry is built). The audio track needs an AAC encoder: `avenc_aac` from gst-libav is registered with rank none and never chosen by encodebin, hence the `GST_PLUGIN_FEATURE_RANK` line above.
+
+Venus wants a firmware the driver accepts: on SM6115 and QCM2290 the driver refuses anything below 6.0.55, and the vendor image on the Pro1-X was 6.0.49. linux-firmware's `qcom/venus-6.0/venus.mbn` loaded on this retail unit, so the board node needs no `firmware-name` for Venus. Decoding through `v4l2h264dec` is registered by the same build; playback through it was not tested on the Pro1-X.
+
+A fallback camera app that talks to libcamera directly is piggz's `harbour-shutter`; as of October 2026 its OBS build does not resolve on Sailfish 5.x.
+
 ### Not solved yet
 
 - **Calls, SMS and mobile data on Qualcomm modems** on victara: the modem talks QMI (it needs `rmtfs` and `qrtr`), and Jolla's ofono is built without its QMI driver. The Pro1-X has them working with the Sailfish-patched upstream oFono, see [Modem](#modem-qualcomm-qrtr-pro1-x); its three oFono patches are not upstream anywhere yet.
-- **Camera.**
-- **Hardware video decoding.**
+- **Camera** on victara. See [Camera and video](#camera-and-video-pro1-x) for the Pro1-X.
+- **Hardware video decoding.** Encoding works on the Pro1-X through Venus (same section); decoding is untested there.
 
 
 ## 14. Hardware Adaptation Checklist
