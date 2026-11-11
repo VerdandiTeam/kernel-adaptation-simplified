@@ -196,6 +196,25 @@ The checker doesn't tell you about these, but you need them too:
 | `CONFIG_BLK_DEV_DM=y`, `CONFIG_DM_CRYPT=y` | The initrd mounts root and home from LVM. DM_CRYPT is for home encryption. |
 | `CONFIG_USB_CONFIGFS=y`, `CONFIG_USB_CONFIGFS_RNDIS=y` | USB networking that works without modules. |
 
+On a 7.x kernel these matter too. Each came from a mer-kernel-check error or from a Sailfish service failing on the Pro1-X (Sailfish OS 5.2, kernel 7.3) **(Pro1-X)**:
+
+| Option | Why |
+|---|---|
+| `CONFIG_PM_AUTOSLEEP=y` | mce suspends the phone by writing to `/sys/power/autosleep`. Without it the file does not exist, mce still reports "Autosuspend policy: enabled", and the phone never suspends: screen off is CPU idle only. arm64 defconfig leaves it off. Check the success count in `/sys/kernel/debug/suspend_stats`. |
+| `CONFIG_MEMCG_V1=y`, `CONFIG_CPUSETS_V1=y` | Sailfish's tmpfiles writes `/sys/fs/cgroup/memory/noswapping`. Without the cgroup v1 hierarchies `systemd-tmpfiles-setup` fails, `user@.service` never starts, and the boot ends without a UI. |
+| `CONFIG_QUOTA_NETLINK_INTERFACE=y`, `CONFIG_QFMT_V2=y` | `quota_nld.service` fails without them. |
+| `CONFIG_NETFILTER_XTABLES_LEGACY=y`, `CONFIG_IP_NF_IPTABLES_LEGACY`, `CONFIG_IP6_NF_IPTABLES_LEGACY`, with the filter, mangle, raw, nat, REJECT and rpfilter pieces | connman's firewall and tethering use the legacy iptables tables, which 7.x kernels hide behind these options. `=m` is fine, iptables loads them on demand. |
+| `CONFIG_NET_L3_MASTER_DEV=y`, `CONFIG_INET_AH`, `CONFIG_INET_ESP`, `CONFIG_INET_IPCOMP`, `CONFIG_INET6_AH`, `CONFIG_INET6_ESP`, `CONFIG_PPP*`, `CONFIG_PPPOE`, `CONFIG_L2TP*` | the VPN plugins Sailfish ships. |
+| `CONFIG_BT_RFCOMM`, `CONFIG_BT_BNEP`, and `CONFIG_BT_LE=y` on arm64 | bluez profiles. arm64 defconfig turns Bluetooth LE off, which leaves no BLE at all. |
+| `CONFIG_NLS_UTF8=y` | vfat SD cards. |
+| `CONFIG_QRTR=y`, `CONFIG_QRTR_SMD=y`, `CONFIG_QCOM_PD_MAPPER=y` (Qualcomm) | the QRTR name service and the protection-domain mapper live in the kernel now. Built in, they exist before the remoteprocs start, and no userspace `pd-mapper` is needed (an old one that is still started misses firmware mounted late). |
+| `CONFIG_ZRAM=m` | Sailfish's `zram` package gives swap in RAM. Optional. |
+
+Two rules the options do not express:
+
+- **Everything between the storage and the panel is built in; drivers that load a file at probe are modules.** With an initrd that loads no modules, the storage controller and its PHY, the clock controllers, interconnect, RPM, pinctrl, DRM and the panel, and their I2C and DMA dependencies have to be `=y`. On the Pro1-X the display and GPU clock controllers, the GENI I2C controller and the GPI DMA as modules made mdss, adreno and the SMMU hit the deferred-probe timeout before udev could load them: the panel never lit and touch probed 47 s late. The other way round, a touch controller that fetches its configuration through the firmware loader (`goodix_9286_cfg.bin`) has to be a module, or the request fails before root is mounted.
+- **If you generate the config, check that every line survived.** Kconfig silently demotes `=y` to `=m` or drops an option whose dependency is missing, and a config resolved on the unpatched tree loses every option the device patches introduce. The Pro1-X builds `arm64 defconfig` plus a device fragment plus a Sailfish fragment, runs `olddefconfig` on the patched tree, then fails the build on any fragment line that does not appear verbatim in `.config`. The first kernel without that check had lost the keyboard, haptics, battery and camera drivers.
+
 ### Build it
 
 **PLATFORM SDK**
