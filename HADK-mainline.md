@@ -1161,6 +1161,20 @@ We found two causes:
 - **Real-time tasks:** by default every real-time task makes schedutil jump to max, and Sailfish runs some daemons as real-time (dsme). `kernel.sched_util_clamp_min_rt_default = 0` in a `/usr/lib/sysctl.d/` file cut the time at max frequency about 6x.
 - **Kernel bug on 32-bit:** on 7.x kernels, an overflow in the scheduler's load tracking (from `089d84203ad4`) kept idle cores at max frequency. We fixed it by making `r` a `u64` in `update_cfs_rq_load_avg()`.
 
+#### Unplugged, the USB controller stays on (Pro1-X)
+
+The DWC3 core forbids runtime PM at probe until userspace allows it; Android's init writes `auto`, nothing in Sailfish does. Unplugged, the controller stays active and its PHY supplies stay on, also through system sleep. A udev rule at `bind` (probe resets the file, so `add` is too early):
+
+```
+ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="dwc3", ATTR{power/control}="auto"
+```
+
+Sleep current on the Pro1-X went from 40-42 mA to 29-32 mA.
+
+#### Nothing wakes the phone once it really sleeps (Pro1-X)
+
+Once the SoC reaches a deep idle state, only interrupts that are wakeup sources wake it, and several that matter on a phone are not, by default, on mainline: the PMIC Type-C port (a cable plugged into a sleeping Pro1-X was seen minutes later), the modem's glink edge (an SMS waited for the next RTC alarm), the touch controller for double-tap to wake. These are kernel changes (`wakeup-source` on the nodes plus small driver patches) in the Pro1-X series. The lesson for a port: list what must wake your phone, then check each in `/sys/kernel/debug/wakeup_sources` before calling suspend done. The wake about every minute on the Pro1-X came from connman: without WoWLAN it reconnected after every resume, and its Wi-Fi autoscan hold-off is a wakeup timer (a one-line patch to `sailfish_wifi` in the port makes it a plain timeout; its effect is not measured yet).
+
 ### Encryption
 
 #### A passphrase prompt appears on the console during boot
@@ -1221,6 +1235,15 @@ Jolla's `gst-plugins-good` is built with `-Dv4l2-probe=false`, which compiles ou
 Venus wants a firmware the driver accepts: on SM6115 and QCM2290 the driver refuses anything below 6.0.55, and the vendor image on the Pro1-X was 6.0.49. linux-firmware's `qcom/venus-6.0/venus.mbn` loaded on this retail unit, so the board node needs no `firmware-name` for Venus. Decoding through `v4l2h264dec` is registered by the same build; playback through it was not tested on the Pro1-X.
 
 A fallback camera app that talks to libcamera directly is piggz's `harbour-shutter`; as of October 2026 its OBS build does not resolve on Sailfish 5.x.
+
+### Boot on an A/B Android bootloader (Pro1-X)
+
+The Pro1-X boots a plain Android boot image (header v0, kernel with the DTB appended) straight from ABL, as chapter 6 produces one; no second bootloader. Two things victara's bootloader does not have:
+
+- **The slot has to be marked successful after every boot.** ABL counts boot attempts per slot and stops booting a slot that is never marked. Run `qbootctl -m` (`github.com/linux-msm/qbootctl`, packaged in the Pro1-X port; it needs the 7.x `scsi_bsg_ufs.h` vendored, because the SDK's kernel headers predate it) from a oneshot in `multi-user.target`.
+- **Partitions carry the slot suffix** (`boot_a`, `modem_a`). Read `androidboot.slot_suffix` from `/proc/cmdline` where a script needs them, as the firmware mount in [Firmware](#firmware) does.
+
+This ABL refuses `fastboot boot`, so every kernel test is a flash of `boot_a`; keep the previous image. From a running system `systemctl reboot bootloader` lands in fastboot. The first logo after power-on is drawn by the signed firmware and cannot be changed; the port draws its own splash from the initramfs onto `/dev/fb0` as its first step, with the kernel console kept off the screen.
 
 ### Not solved yet
 
